@@ -43,6 +43,7 @@ define_error_codes!(
 
     ASSERTION_FAILED => ("AssertionFailed", "", ""),
     LOCK_IF_EXISTS_FAILED => ("LockIfExistsFailed", "", ""),
+    TXN_GC_EXPIRED => ("TxnGcExpired", "", ""),
 
     PRIMARY_MISMATCH => ("PrimaryMismatch", "", ""),
     UNDETERMINED => ("Undetermined", "", ""),

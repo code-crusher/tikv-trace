@@ -16,7 +16,7 @@ use crate::storage::{
         actions::{common::check_committed_record_on_err, prewrite::prewrite_with_generation},
         commands::{
             CommandExt, ReaderWithStats, ReleasedLocks, ResponsePolicy, WriteCommand, WriteContext,
-            WriteResult,
+            WriteResult, check_start_ts_not_below_safe_point,
         },
     },
 };
@@ -76,6 +76,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for Flush {
             ))
             .into());
         }
+        check_start_ts_not_below_safe_point(self.start_ts, &context.safe_point)?;
         let rows = self.mutations.len();
         let mut txn = MvccTxn::new(self.start_ts, context.concurrency_manager);
         let mut reader = ReaderWithStats::new(

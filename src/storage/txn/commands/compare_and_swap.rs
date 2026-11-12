@@ -387,6 +387,7 @@ mod tests {
             async_apply_prewrite: false,
             raw_ext,
             txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let ret = cmd.cmd.process_write(snap, context)?;
         match ret.pr {
@@ -443,6 +444,7 @@ mod tests {
             async_apply_prewrite: false,
             raw_ext,
             txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let cmd: Command = cmd.into();
         let write_result = cmd.process_write(snap, context).unwrap();

@@ -32,7 +32,10 @@ use std::{
     iter,
     marker::PhantomData,
     ops::{Deref, DerefMut},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 pub use acquire_pessimistic_lock::AcquirePessimisticLock;
@@ -75,7 +78,7 @@ use crate::storage::{
     },
     metrics,
     mvcc::{ReleasedLock, SnapshotReader},
-    txn::{ProcessResult, Result, latch, txn_status_cache::TxnStatusCache},
+    txn::{Error, ErrorInner, ProcessResult, Result, latch, txn_status_cache::TxnStatusCache},
     types::{
         MvccInfo, PessimisticLockParameters, PessimisticLockResults, PrewriteResult,
         SecondaryLocksStatus, StorageCallbackType, TxnStatus,
@@ -612,6 +615,32 @@ pub struct RawExt {
     pub key_guard: KeyHandleGuard,
 }
 
+/// Rejects a transaction command whose start ts is below the GC safe point this
+/// store has loaded.
+///
+/// Once GC has advanced past a transaction's start ts, the versions its
+/// snapshot was based on may have been cleaned up (by the GC worker or by the
+/// compaction filter, which both use exactly this safe point). Accepting a
+/// prewrite or a pessimistic lock request for such a transaction would let it
+/// create durable writes without the write conflicts it should have observed,
+/// for example resurrecting a row that was deleted and already GC-ed.
+///
+/// A safe point of zero means GC has not initialized yet, in which case nothing
+/// has been GC-ed and the command is accepted.
+pub fn check_start_ts_not_below_safe_point(
+    start_ts: TimeStamp,
+    safe_point: &AtomicU64,
+) -> Result<()> {
+    let safe_point = safe_point.load(Ordering::Relaxed);
+    if safe_point != 0 && start_ts.into_inner() < safe_point {
+        return Err(Error::from(ErrorInner::TxnGcExpired {
+            start_ts,
+            safe_point: TimeStamp::from(safe_point),
+        }));
+    }
+    Ok(())
+}
+
 pub struct WriteContext<'a, L: LockManager> {
     pub lock_mgr: &'a L,
     pub concurrency_manager: ConcurrencyManager,
@@ -621,6 +650,9 @@ pub struct WriteContext<'a, L: LockManager> {
     pub raw_ext: Option<RawExt>,
     // use for apiv2
     pub txn_status_cache: Arc<TxnStatusCache>,
+    /// The GC safe point this TiKV instance has loaded from PD. It's shared
+    /// with the GC worker, which is the only writer.
+    pub safe_point: Arc<AtomicU64>,
 }
 
 pub struct ReaderWithStats<'a, S: Snapshot> {
@@ -909,6 +941,7 @@ pub mod test_util {
             async_apply_prewrite: false,
             raw_ext: None,
             txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let ret = cmd.cmd.process_write(snap, context)?;
         let res = match ret.pr {
@@ -1071,6 +1104,7 @@ pub mod test_util {
             async_apply_prewrite: false,
             raw_ext: None,
             txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         let ret = cmd.cmd.process_write(snap, context)?;
@@ -1097,6 +1131,7 @@ pub mod test_util {
             async_apply_prewrite: false,
             raw_ext: None,
             txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         let ret = cmd.cmd.process_write(snap, context)?;
@@ -1152,6 +1187,7 @@ pub mod test_util {
             async_apply_prewrite: false,
             raw_ext: None,
             txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         let ret = cmd.cmd.process_write(snap, context).unwrap();

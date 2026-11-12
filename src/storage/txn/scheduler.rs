@@ -291,6 +291,11 @@ struct TxnSchedulerInner<L: LockManager> {
 
     in_memory_peer_size_limit: Arc<AtomicU64>,
     in_memory_instance_size_limit: Arc<AtomicU64>,
+
+    /// The GC safe point loaded by the GC worker. Used to reject transaction
+    /// commands whose start ts is below it, as their snapshot may already
+    /// have been cleaned up by GC.
+    safe_point: Arc<AtomicU64>,
 }
 
 #[inline]
@@ -447,6 +452,7 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
         resource_ctl: Option<Arc<ResourceController>>,
         resource_manager: Option<Arc<ResourceGroupManager>>,
         txn_status_cache: Arc<TxnStatusCache>,
+        safe_point: Arc<AtomicU64>,
     ) -> Self {
         let t = Instant::now_coarse();
         let mut task_slots = Vec::with_capacity(TASKS_SLOTS_NUM);
@@ -488,6 +494,7 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
             memory_quota: Arc::new(MemoryQuota::new(config.memory_quota.0 as _)),
             in_memory_peer_size_limit: dynamic_configs.in_memory_peer_size_limit,
             in_memory_instance_size_limit: dynamic_configs.in_memory_instance_size_limit,
+            safe_point,
         });
 
         SCHED_TXN_MEMORY_QUOTA
@@ -1480,6 +1487,7 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
                 async_apply_prewrite: txn_scheduler.inner.enable_async_apply_prewrite,
                 raw_ext,
                 txn_status_cache: txn_scheduler.inner.txn_status_cache.clone(),
+                safe_point: txn_scheduler.inner.safe_point.clone(),
             };
             let begin_instant = Instant::now();
             // A resumed-lock command can merge requests with different tags. TopSQL
@@ -2393,6 +2401,13 @@ impl<E: Engine, L: LockManager> TxnScheduler<E, L> {
     pub fn get_txn_status_cache(&self) -> Arc<TxnStatusCache> {
         self.inner.txn_status_cache.clone()
     }
+
+    /// Gets the GC safe point shared with the GC worker. Zero means GC has not
+    /// initialized a safe point yet, in which case transaction commands are not
+    /// checked against it.
+    pub fn get_gc_safe_point(&self) -> Arc<AtomicU64> {
+        self.inner.safe_point.clone()
+    }
 }
 
 pub async fn get_raw_ext(
@@ -2559,6 +2574,7 @@ mod tests {
                 Some(controller),
                 Some(resource_manager),
                 Arc::new(TxnStatusCache::new_for_test()),
+                Arc::new(AtomicU64::new(0)),
             ),
             engine,
         )
@@ -2913,6 +2929,7 @@ mod tests {
             Some(controller),
             Some(resource_manager),
             Arc::new(TxnStatusCache::new_for_test()),
+            Arc::new(AtomicU64::new(0)),
         );
         // Use sync mode if pipelined_pessimistic_lock is false.
         assert_eq!(scheduler.pessimistic_lock_mode(), PessimisticLockMode::Sync);

@@ -35,7 +35,7 @@ use crate::storage::{
         },
         commands::{
             Command, CommandExt, ReleasedLocks, ResponsePolicy, TypedCommand, WriteCommand,
-            WriteContext, WriteResult,
+            WriteContext, WriteResult, check_start_ts_not_below_safe_point,
         },
     },
     types::PrewriteResult,
@@ -536,6 +536,7 @@ impl<K: PrewriteKind> Prewriter<K> {
             }
         }
 
+        check_start_ts_not_below_safe_point(self.start_ts, &context.safe_point)?;
         self.kind
             .can_skip_constraint_check(&mut self.mutations, &snapshot, &mut context)?;
         self.check_max_ts_synced(&snapshot)?;
@@ -1680,6 +1681,7 @@ mod tests {
                     async_apply_prewrite: false,
                     raw_ext: None,
                     txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+                    safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 }
             };
         }
@@ -1852,6 +1854,7 @@ mod tests {
                 async_apply_prewrite: case.async_apply_prewrite,
                 raw_ext: None,
                 txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+                safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             };
             let mut engine = TestEngineBuilder::new().build().unwrap();
             let snap = engine.snapshot(Default::default()).unwrap();
@@ -1963,6 +1966,7 @@ mod tests {
             async_apply_prewrite: false,
             raw_ext: None,
             txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let snap = engine.snapshot(Default::default()).unwrap();
         let result = cmd.cmd.process_write(snap, context).unwrap();
@@ -1992,6 +1996,7 @@ mod tests {
             async_apply_prewrite: false,
             raw_ext: None,
             txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let snap = engine.snapshot(Default::default()).unwrap();
         let result = cmd.cmd.process_write(snap, context).unwrap();
@@ -2076,6 +2081,7 @@ mod tests {
             async_apply_prewrite: false,
             raw_ext: None,
             txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let snap = engine.snapshot(Default::default()).unwrap();
         let result = cmd.cmd.process_write(snap, context).unwrap();
@@ -2109,6 +2115,7 @@ mod tests {
             async_apply_prewrite: false,
             raw_ext: None,
             txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let snap = engine.snapshot(Default::default()).unwrap();
         let result = cmd.cmd.process_write(snap, context).unwrap();
@@ -2380,6 +2387,7 @@ mod tests {
             async_apply_prewrite: false,
             raw_ext: None,
             txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let snap = engine.snapshot(Default::default()).unwrap();
         assert!(prewrite_cmd.cmd.process_write(snap, context).is_err());
@@ -2405,6 +2413,7 @@ mod tests {
             async_apply_prewrite: false,
             raw_ext: None,
             txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let snap = engine.snapshot(Default::default()).unwrap();
         assert!(prewrite_cmd.cmd.process_write(snap, context).is_err());
@@ -2612,6 +2621,7 @@ mod tests {
             async_apply_prewrite: false,
             raw_ext: None,
             txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let snap = engine.snapshot(Default::default()).unwrap();
         let res = prewrite_cmd.cmd.process_write(snap, context).unwrap();

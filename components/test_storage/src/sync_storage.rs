@@ -35,6 +35,7 @@ pub struct SyncTestStorageBuilder<E: Engine, F: KvFormat> {
     engine: E,
     config: Option<Config>,
     gc_config: Option<GcConfig>,
+    safe_point: Arc<AtomicU64>,
     _phantom: PhantomData<F>,
 }
 
@@ -51,6 +52,7 @@ impl<F: KvFormat> SyncTestStorageBuilder<RocksEngine, F> {
                 .unwrap(),
             config: None,
             gc_config: None,
+            safe_point: Arc::new(AtomicU64::new(0)),
             _phantom: PhantomData,
         }
     }
@@ -68,8 +70,15 @@ impl<E: Engine, F: KvFormat> SyncTestStorageBuilder<E, F> {
             engine,
             config: None,
             gc_config: None,
+            safe_point: Arc::new(AtomicU64::new(0)),
             _phantom: PhantomData,
         }
+    }
+
+    #[must_use]
+    pub fn safe_point(mut self, safe_point: Arc<AtomicU64>) -> Self {
+        self.safe_point = safe_point;
+        self
     }
 
     #[must_use]
@@ -88,7 +97,8 @@ impl<E: Engine, F: KvFormat> SyncTestStorageBuilder<E, F> {
         let mut builder = TestStorageBuilder::<_, _, F>::from_engine_and_lock_mgr(
             self.engine.clone(),
             MockLockManager::new(),
-        );
+        )
+        .set_safe_point(self.safe_point.clone());
         if let Some(config) = self.config.take() {
             builder = builder.config(config);
         }
@@ -541,8 +551,10 @@ where
         &mut self,
         cfg: AutoGcConfig<S, R>,
     ) {
+        // Share the storage's safe point so the GC worker updates what the
+        // scheduler reads.
         self.gc_worker
-            .start_auto_gc(cfg, Arc::new(AtomicU64::new(0)))
+            .start_auto_gc(cfg, self.store.get_scheduler().get_gc_safe_point())
             .unwrap();
     }
 }

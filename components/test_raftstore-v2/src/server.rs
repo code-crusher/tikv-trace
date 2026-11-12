@@ -559,6 +559,9 @@ impl<EK: KvEngine> ServerCluster<EK> {
                 .map(|m| m.derive_controller("scheduler-worker-pool".to_owned(), true)),
             resource_manager.clone(),
             txn_status_cache,
+            // The GC worker is not run in this test cluster, so the safe point
+            // stays zero and the start-ts check stays disabled.
+            std::sync::atomic::AtomicU64::new(0).into(),
         )?;
         self.storages.insert(node_id, raft_kv_v2.clone());
 

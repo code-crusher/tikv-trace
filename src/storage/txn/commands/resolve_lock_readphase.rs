@@ -160,6 +160,7 @@ mod tests {
             async_apply_prewrite: false,
             raw_ext: None,
             txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let result = command.process_write(snapshot, write_context).unwrap();
         write(engine, &ctx, result.to_be_write.modifies);

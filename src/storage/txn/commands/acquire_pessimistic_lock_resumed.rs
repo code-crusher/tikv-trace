@@ -24,7 +24,7 @@ use crate::storage::{
         commands::{
             Command, CommandExt, ReleasedLocks, ResponsePolicy, TypedCommand, WriteCommand,
             WriteContext, WriteResult, WriteResultLockInfo,
-            acquire_pessimistic_lock::make_write_data,
+            acquire_pessimistic_lock::make_write_data, check_start_ts_not_below_safe_point,
         },
     },
     types::{PessimisticLockParameters, PessimisticLockResults},
@@ -91,6 +91,9 @@ impl CommandExt for AcquirePessimisticLockResumed {
 impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for AcquirePessimisticLockResumed {
     fn process_write(self, snapshot: S, context: WriteContext<'_, L>) -> Result<WriteResult> {
         fail_point!("acquire_pessimistic_lock_resumed_before_process_write");
+        if let Some(item) = self.items.first() {
+            check_start_ts_not_below_safe_point(item.params.start_ts, &context.safe_point)?;
+        }
         let mut modifies = vec![];
         let mut new_acquired_locks = vec![];
         let mut txn = None;
@@ -330,6 +333,7 @@ mod tests {
                     async_apply_prewrite: false,
                     raw_ext: None,
                     txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+                    safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 },
             )
             .unwrap();

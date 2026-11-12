@@ -507,6 +507,7 @@ impl ServerCluster {
                 .map(|m| m.derive_controller("scheduler-worker-pool".to_owned(), true)),
             resource_manager.clone(),
             txn_status_cache,
+            self.gc_safe_point.clone(),
         )?;
         self.storages.insert(node_id, raft_kv.clone());
 

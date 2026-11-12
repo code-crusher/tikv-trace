@@ -742,6 +742,13 @@ where
             self.core.config.storage.txn_status_cache_capacity,
         ));
 
+        // The GC safe point this store has loaded from PD. It is shared by the
+        // storage scheduler (which rejects transaction commands whose start ts
+        // is below it) and the GC worker (which updates it). It has to be
+        // created before the storage so the scheduler can reject expired
+        // transactions from the start.
+        let safe_point = Arc::new(AtomicU64::new(0));
+
         let storage = Storage::<_, _, F>::from_engine(
             engines.engine.clone(),
             &self.core.config.storage,
@@ -760,6 +767,7 @@ where
                 .map(|m| m.derive_controller("scheduler-worker-pool".to_owned(), true)),
             self.resource_manager.clone(),
             txn_status_cache.clone(),
+            safe_point.clone(),
         )
         .unwrap_or_else(|e| fatal!("failed to create raft storage: {}", e));
         cfg_controller.register(
@@ -1095,7 +1103,9 @@ where
 
         // `ConsistencyCheckObserver` must be registered before
         // `MultiRaftServer::start`.
-        let safe_point = Arc::new(AtomicU64::new(0));
+        // Reuse the `safe_point` created together with the storage: the
+        // consistency check observer, the GC worker and the storage scheduler
+        // all observe the same GC safe point.
         let observer = match self.core.config.coprocessor.consistency_check_method {
             ConsistencyCheckMethod::Mvcc => BoxConsistencyCheckObserver::new(
                 MvccConsistencyCheckObserver::new(safe_point.clone()),

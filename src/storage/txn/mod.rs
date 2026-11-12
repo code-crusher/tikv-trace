@@ -165,6 +165,15 @@ pub enum ErrorInner {
 
     #[error("{0}")]
     InvalidMaxTsUpdate(#[from] concurrency_manager::InvalidMaxTsUpdate),
+
+    #[error(
+        "GC life time is shorter than transaction duration, \
+        txn start ts: {start_ts}, GC safe point: {safe_point}"
+    )]
+    TxnGcExpired {
+        start_ts: TimeStamp,
+        safe_point: TimeStamp,
+    },
 }
 
 impl ErrorInner {
@@ -207,6 +216,13 @@ impl ErrorInner {
             ErrorInner::InvalidMaxTsUpdate(ref e) => {
                 Some(ErrorInner::InvalidMaxTsUpdate(e.clone()))
             }
+            ErrorInner::TxnGcExpired {
+                start_ts,
+                safe_point,
+            } => Some(ErrorInner::TxnGcExpired {
+                start_ts,
+                safe_point,
+            }),
             ErrorInner::Other(_) | ErrorInner::ProtoBuf(_) | ErrorInner::Io(_) => None,
         }
     }
@@ -262,6 +278,7 @@ impl ErrorCodeExt for Error {
             }
             ErrorInner::FlashbackNotPrepared(_) => error_code::storage::FLASHBACK_NOT_PREPARED,
             ErrorInner::InvalidMaxTsUpdate { .. } => error_code::storage::INVALID_MAX_TS_UPDATE,
+            ErrorInner::TxnGcExpired { .. } => error_code::storage::TXN_GC_EXPIRED,
         }
     }
 }

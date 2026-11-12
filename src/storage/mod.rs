@@ -292,6 +292,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         resource_ctl: Option<Arc<ResourceController>>,
         resource_manager: Option<Arc<ResourceGroupManager>>,
         txn_status_cache: Arc<TxnStatusCache>,
+        safe_point: Arc<AtomicU64>,
     ) -> Result<Self> {
         assert_eq!(config.api_version(), F::TAG, "Api version not match");
 
@@ -310,6 +311,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             resource_ctl,
             resource_manager.clone(),
             txn_status_cache,
+            safe_point,
         );
 
         info!("Storage started.");
@@ -3667,6 +3669,7 @@ pub struct TestStorageBuilder<E: Engine, L: LockManager, F: KvFormat> {
     _phantom: PhantomData<F>,
     in_memory_peer_size_limit: Arc<AtomicU64>,
     in_memory_instance_size_limit: Arc<AtomicU64>,
+    safe_point: Arc<AtomicU64>,
 }
 
 /// TestStorageBuilder for Api V1
@@ -3812,6 +3815,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
             _phantom: PhantomData,
             in_memory_peer_size_limit: Arc::new(AtomicU64::new(512 << 10)),
             in_memory_instance_size_limit: Arc::new(AtomicU64::new(100 << 20)),
+            safe_point: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -3856,6 +3860,13 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
         self
     }
 
+    /// Sets the GC safe point shared with the GC worker. Transaction commands
+    /// whose start ts is below the safe point are rejected by the scheduler.
+    pub fn set_safe_point(mut self, safe_point: Arc<AtomicU64>) -> Self {
+        self.safe_point = safe_point;
+        self
+    }
+
     /// Build a `Storage<E>`.
     pub fn build(self) -> Result<Storage<E, L, F>> {
         let read_pool = build_read_pool_for_test(
@@ -3893,6 +3904,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
             Some(resource_ctl),
             Some(manager),
             Arc::new(TxnStatusCache::new_for_test()),
+            self.safe_point.clone(),
         )
     }
 
@@ -3929,6 +3941,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
             Some(resource_ctl),
             Some(manager),
             Arc::new(TxnStatusCache::new_for_test()),
+            self.safe_point.clone(),
         )
     }
 
@@ -3968,6 +3981,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
             Some(resource_controller),
             Some(resource_manager),
             Arc::new(TxnStatusCache::new_for_test()),
+            self.safe_point.clone(),
         )
     }
 }
@@ -4723,6 +4737,142 @@ mod tests {
     }
 
     #[test]
+    fn test_reject_txn_cmd_below_gc_safe_point() {
+        // Reproduces tikv/tikv#20228: a prewrite (or pessimistic lock request)
+        // whose start ts is below the GC safe point this store has loaded must
+        // be rejected, because GC may already have removed the newer versions
+        // the prewrite would have conflicted with.
+        let safe_point = Arc::new(AtomicU64::new(0));
+        let mut storage = TestStorageBuilderApiV1::new(MockLockManager::new())
+            .set_safe_point(safe_point.clone())
+            .build()
+            .unwrap();
+        let (tx, rx) = channel();
+
+        // GC has loaded a safe point past the transaction's start ts.
+        safe_point.store(30, Ordering::SeqCst);
+
+        let expect_gc_expired = |e: Error| match e {
+            Error(box ErrorInner::Txn(TxnError(box TxnErrorInner::TxnGcExpired {
+                start_ts,
+                safe_point,
+            }))) => {
+                assert_eq!(start_ts, 10.into());
+                assert_eq!(safe_point, 30.into());
+            }
+            e => panic!("unexpected error: {:?}", e),
+        };
+
+        // An optimistic prewrite below the safe point is rejected and leaves
+        // no lock behind.
+        storage
+            .sched_txn_command(
+                commands::Prewrite::with_defaults(
+                    vec![Mutation::make_put(Key::from_raw(b"x"), b"z".to_vec())],
+                    b"x".to_vec(),
+                    10.into(),
+                ),
+                expect_fail_callback(tx.clone(), 0, expect_gc_expired),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        must_unlocked(&mut storage.engine, b"x");
+
+        // 1PC prewrite.
+        storage
+            .sched_txn_command(
+                commands::Prewrite::with_1pc(
+                    vec![Mutation::make_put(Key::from_raw(b"x"), b"z".to_vec())],
+                    b"x".to_vec(),
+                    10.into(),
+                    100.into(),
+                ),
+                expect_fail_callback(tx.clone(), 1, expect_gc_expired),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        must_unlocked(&mut storage.engine, b"x");
+
+        // Async commit prewrite.
+        let mut cmd = commands::Prewrite::new(
+            vec![Mutation::make_put(Key::from_raw(b"x"), b"z".to_vec())],
+            b"x".to_vec(),
+            10.into(),
+            0,
+            false,
+            0,
+            TimeStamp::default(),
+            100.into(),
+            Some(vec![]),
+            false,
+            AssertionLevel::Off,
+            Context::default(),
+        );
+        if let Command::Prewrite(p) = &mut cmd.cmd {
+            p.secondary_keys = Some(vec![b"y".to_vec()]);
+        }
+        storage
+            .sched_txn_command(cmd, expect_fail_callback(tx.clone(), 2, expect_gc_expired))
+            .unwrap();
+        rx.recv().unwrap();
+        must_unlocked(&mut storage.engine, b"x");
+
+        // A pessimistic lock request below the safe point is rejected too.
+        storage
+            .sched_txn_command(
+                commands::AcquirePessimisticLock::new(
+                    vec![(Key::from_raw(b"x"), true, false)],
+                    b"x".to_vec(),
+                    10.into(),
+                    3000,
+                    false,
+                    10.into(),
+                    None,
+                    false,
+                    TimeStamp::default(),
+                    false,
+                    false,
+                    false,
+                    Context::default(),
+                ),
+                expect_fail_callback(tx.clone(), 3, expect_gc_expired),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        must_unlocked(&mut storage.engine, b"x");
+
+        // A start ts at or above the safe point is still accepted.
+        safe_point.store(30, Ordering::SeqCst);
+        storage
+            .sched_txn_command(
+                commands::Prewrite::with_defaults(
+                    vec![Mutation::make_put(Key::from_raw(b"x"), b"z".to_vec())],
+                    b"x".to_vec(),
+                    30.into(),
+                ),
+                expect_ok_callback(tx.clone(), 4),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        must_locked(&mut storage.engine, b"x", 30);
+
+        // A safe point of zero (GC not initialized) never rejects anything.
+        safe_point.store(0, Ordering::SeqCst);
+        storage
+            .sched_txn_command(
+                commands::Prewrite::with_defaults(
+                    vec![Mutation::make_put(Key::from_raw(b"y"), b"z".to_vec())],
+                    b"y".to_vec(),
+                    10.into(),
+                ),
+                expect_ok_callback(tx, 5),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        must_locked(&mut storage.engine, b"y", 10);
+    }
+
+    #[test]
     fn test_prewrite_blocks_read() {
         use kvproto::kvrpcpb::ExtraOp;
         let mut storage = TestStorageBuilderApiV1::new(MockLockManager::new())
@@ -4748,6 +4898,7 @@ mod tests {
                     async_apply_prewrite: false,
                     raw_ext: None,
                     txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+                    safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 },
             )
             .unwrap();

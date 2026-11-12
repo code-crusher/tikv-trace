@@ -17,6 +17,7 @@ use crate::storage::{
         commands::{
             Command, CommandExt, ReaderWithStats, ReleasedLocks, ResponsePolicy, TypedCommand,
             WriteCommand, WriteContext, WriteResult, WriteResultLockInfo,
+            check_start_ts_not_below_safe_point,
         },
     },
     types::{PessimisticLockParameters, PessimisticLockResults},
@@ -86,6 +87,8 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for AcquirePessimisticLock 
                 "multiple keys in a single request with allowed_lock_with_conflict set is not allowed"
             ))));
         }
+
+        check_start_ts_not_below_safe_point(self.start_ts, &context.safe_point)?;
 
         let (start_ts, ctx, keys) = (self.start_ts, self.ctx, self.keys);
         let mut txn = MvccTxn::new(start_ts, context.concurrency_manager);
@@ -530,6 +533,7 @@ mod tests {
             async_apply_prewrite: false,
             raw_ext: None,
             txn_status_cache: Arc::new(TxnStatusCache::new_for_test()),
+            safe_point: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         cmd.cmd.process_write(snap, context).unwrap()
     }
