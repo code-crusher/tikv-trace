@@ -60,10 +60,6 @@ impl CompactedEvent for PanicCompactedEvent {
         panic!()
     }
 
-    fn is_size_declining_trivial(&self, split_check_diff: u64) -> bool {
-        panic!()
-    }
-
     fn output_level_label(&self) -> String {
         panic!()
     }

@@ -106,8 +106,6 @@ pub trait CompactedEvent: Send {
 
     fn total_bytes_declined(&self) -> u64;
 
-    fn is_size_declining_trivial(&self, split_check_diff: u64) -> bool;
-
     fn output_level_label(&self) -> String;
 
     /// This takes self by value so that engine_rocks can move keys out of the

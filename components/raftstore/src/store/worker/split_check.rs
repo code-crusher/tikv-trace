@@ -473,6 +473,45 @@ where
     }
 }
 
+/// Calculates how many bytes each Region overlapping a finished compaction job
+/// has declined. Returns `None` when the event's key range cannot be mapped to
+/// Regions.
+fn calc_region_declined_bytes<E: CompactedEvent, P: RegionInfoProvider + ?Sized>(
+    provider: &P,
+    event: E,
+    region_split_check_diff: u64,
+) -> Option<Vec<(u64, u64)>> {
+    let (start_key, end_key) = event.get_key_range();
+    // Compaction events report data keys, while Regions are indexed by origin
+    // key. Looking up data keys would only ever find the last Region, so all
+    // other Regions would never be credited. The range may also include local
+    // keys, which belong to no Region, so clamp the range to the data key
+    // space the same way the compaction guard does.
+    let (start_key, end_key) = match (
+        keys::validate_data_key(&start_key),
+        keys::validate_data_key(&end_key),
+    ) {
+        (true, true) => (keys::origin_key(&start_key), keys::origin_end_key(&end_key)),
+        (true, false) => (keys::origin_key(&start_key), b"".as_slice()),
+        (false, true) => (b"".as_slice(), keys::origin_end_key(&end_key)),
+        (false, false) => {
+            if start_key.as_slice() < keys::DATA_MIN_KEY && end_key.as_slice() >= keys::DATA_MAX_KEY
+            {
+                (b"".as_slice(), b"".as_slice())
+            } else {
+                return None;
+            }
+        }
+    };
+    let regions = provider.get_regions_in_range(start_key, end_key).ok()?;
+    let mut ranges = BTreeMap::<Vec<u8>, u64>::new();
+    regions.iter().for_each(|r| {
+        ranges.insert(keys::enc_end_key(r), r.id);
+    });
+    // region_split_check_diff / 16 is an experienced value.
+    Some(event.calc_ranges_declined_bytes(&ranges, region_split_check_diff / 16))
+}
+
 pub struct Runner<EK: KvEngine, S> {
     // We can't just use `TabletRegistry` here, otherwise v1 may create many
     // invalid records and cause other problems.
@@ -1291,8 +1330,14 @@ impl<EK: KvEngine, S: StoreHandle> Runner<EK, S> {
     }
 
     fn on_compaction_finished(&self, event: EK::CompactedEvent, region_split_check_diff: u64) {
+        // The decline is checked per Region below. A compaction job that only
+        // declines a small fraction of its input can still reclaim a lot of
+        // data from one Region, and GC reclaims space gradually, so gating on
+        // the job as a whole would leave those Regions with a stale size.
+        // A job that declines less than the per-Region threshold cannot credit
+        // any Region, so it is still skipped cheaply.
         if self.region_info_provider.is_none()
-            || event.is_size_declining_trivial(region_split_check_diff)
+            || event.total_bytes_declined() < region_split_check_diff / 16
         {
             return;
         }
@@ -1302,25 +1347,13 @@ impl<EK: KvEngine, S: StoreHandle> Runner<EK, S> {
             .with_label_values(&[&output_level_str])
             .observe(event.total_bytes_declined() as f64);
 
-        let mut region_declined_bytes = {
-            // Get the target regions and convert the corresponding ranges into
-            // the target format. Then, calculate the influenced ranges.
-            let (start_key, end_key) = event.get_key_range();
-            if let Ok(regions) = self
-                .region_info_provider
-                .as_ref()
-                .unwrap()
-                .get_regions_in_range(&start_key, &end_key)
-            {
-                let mut ranges = BTreeMap::<Vec<u8>, u64>::new();
-                regions.iter().for_each(|r| {
-                    ranges.insert(keys::enc_end_key(r), r.id);
-                });
-                // region_split_check_diff / 16 is an experienced value.
-                event.calc_ranges_declined_bytes(&ranges, region_split_check_diff / 16)
-            } else {
-                vec![]
-            }
+        let mut region_declined_bytes = match calc_region_declined_bytes(
+            self.region_info_provider.as_ref().unwrap().as_ref(),
+            event,
+            region_split_check_diff,
+        ) {
+            Some(declined_bytes) => declined_bytes,
+            None => return,
         };
 
         COMPACTION_RELATED_REGION_COUNT
@@ -1418,6 +1451,7 @@ where
 mod tests {
     use std::sync::mpsc;
 
+    use engine_rocks::{RangeOffsets, RangeProperties, RocksCompactedEvent};
     use engine_test::{
         ctor::{CfOptions, DbOptions},
         kv::KvTestEngine,
@@ -1433,10 +1467,130 @@ mod tests {
     use crate::{
         coprocessor::{
             BoxSplitCheckObserver, Coprocessor, ObserverContext, SplitCheckObserver,
-            dispatcher::SchedTask,
+            dispatcher::SchedTask, region_info_accessor::MockRegionInfoProvider,
         },
         store::{SplitValidator, peer::SplitCheckTrigger},
     };
+
+    fn test_region(id: u64, start_key: &[u8], end_key: &[u8]) -> Region {
+        let mut region = Region::default();
+        region.set_id(id);
+        region.set_start_key(start_key.to_vec());
+        region.set_end_key(end_key.to_vec());
+        region.mut_peers().push(Default::default());
+        region
+    }
+
+    fn test_compacted_event(
+        start_key: &[u8],
+        end_key: &[u8],
+        total_input_bytes: u64,
+        total_output_bytes: u64,
+    ) -> RocksCompactedEvent {
+        RocksCompactedEvent {
+            cf: CF_WRITE.to_owned(),
+            output_level: 3,
+            total_input_bytes,
+            total_output_bytes,
+            start_key: start_key.to_vec(),
+            end_key: end_key.to_vec(),
+            input_props: vec![],
+            output_props: vec![],
+        }
+    }
+
+    /// A compaction job whose total decline is a small fraction of its input
+    /// can still reclaim a lot of data from a single Region. GC reclaims space
+    /// gradually, so the decline must be credited per Region rather than
+    /// dropping the whole job.
+    #[test]
+    fn test_compaction_credits_regions_below_ten_percent_of_job_input() {
+        let provider = MockRegionInfoProvider::new(vec![test_region(2, b"k40", b"k50")]);
+
+        // 64 KiB is reclaimed from one Region out of a 1 MiB job, i.e. well
+        // below the 10% of input that used to drop the whole job.
+        let input = RangeProperties {
+            offsets: vec![(
+                keys::data_key(b"k40"),
+                RangeOffsets {
+                    size: 1024 * 1024,
+                    keys: 100,
+                },
+            )],
+        };
+        let output = RangeProperties {
+            offsets: vec![(
+                keys::data_key(b"k40"),
+                RangeOffsets {
+                    size: 1024 * 1024 - 64 * 1024,
+                    keys: 90,
+                },
+            )],
+        };
+        let event = RocksCompactedEvent {
+            cf: CF_WRITE.to_owned(),
+            output_level: 3,
+            total_input_bytes: 1024 * 1024,
+            total_output_bytes: 1024 * 1024 - 64 * 1024,
+            start_key: keys::data_key(b"k40"),
+            end_key: keys::data_key(b"k50"),
+            input_props: vec![input],
+            output_props: vec![output],
+        };
+        assert!(event.total_bytes_declined() * 10 < event.total_input_bytes);
+
+        let declined = calc_region_declined_bytes(&provider, event, 1024).unwrap();
+        assert_eq!(
+            declined,
+            vec![(2, 64 * 1024)],
+            "the Region must be credited even though the job declined under 10%"
+        );
+    }
+
+    /// Compaction events report data keys. Looking them up directly in the
+    /// Region metadata only ever matches the last Region, so every other
+    /// affected Region would never be credited.
+    #[test]
+    fn test_compaction_event_key_range_is_looked_up_as_origin_keys() {
+        let provider = MockRegionInfoProvider::new(vec![
+            test_region(1, b"", b"k50"),
+            test_region(2, b"k50", b""),
+        ]);
+        let start_key = keys::data_key(b"k10");
+        let end_key = keys::data_key(b"k90");
+        let event = test_compacted_event(&start_key, &end_key, 1, 0);
+
+        // Both Regions overlap the job's range, so both are considered.
+        let ranges: Vec<_> = provider
+            .get_regions_in_range(b"k10", b"k90")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get_id())
+            .collect();
+        assert_eq!(ranges, vec![1, 2]);
+
+        // Passing the raw data keys would only match the last Region.
+        let data_ranges: Vec<_> = provider
+            .get_regions_in_range(&keys::data_key(b"k10"), &keys::data_key(b"k90"))
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get_id())
+            .collect();
+        assert_eq!(data_ranges, vec![2]);
+
+        // `calc_region_declined_bytes` converts the keys, so both Regions are
+        // reported as influenced. No SST properties are supplied, so no bytes
+        // are attributed here; the region set is what matters.
+        let declined = calc_region_declined_bytes(&provider, event, 1024).unwrap();
+        assert!(declined.is_empty());
+    }
+
+    #[test]
+    fn test_compaction_event_rejects_non_data_keys() {
+        let provider = MockRegionInfoProvider::new(vec![test_region(1, b"", b"")]);
+        let event = test_compacted_event(b"k10", b"k90", 1024, 0);
+        assert!(calc_region_declined_bytes(&provider, event, 1024).is_none());
+    }
 
     #[derive(Clone)]
     struct AssertSplitCheckEnabled(SplitValidator);

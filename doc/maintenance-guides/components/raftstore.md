@@ -210,6 +210,15 @@ High-risk contracts:
   splitting without new writes. A partial key-range check cannot establish that
   the entire Region is unsplittable. During disabled refreshes, low estimates
   must not clear split hints established by earlier full scans.
+- Compaction-declined bytes are credited per Region, never per compaction job.
+  GC reclaims space outside the Raft write path, so `size_diff_hint` does not
+  move and a stale approximate size is only refreshed through this credit. A
+  job that declines a small fraction of its input can still reclaim a lot from
+  one Region, so dropping jobs by their job-wide decline ratio would leave
+  cold Regions unmerged. Only a job whose total decline is below the per-Region
+  threshold (`region_split_check_diff / 16`) can be skipped. The Region lookup
+  must convert the event's data keys to origin keys; Regions are indexed by
+  origin key, so looking up data keys matches only the last Region.
 - Approximate checks selected for buckets must still honor table-boundary
   splits. The table checker returns an already known boundary or requests a
   scan fallback when the boundary requires examining keys; disabled automatic
