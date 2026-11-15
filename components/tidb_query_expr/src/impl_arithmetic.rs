@@ -4,9 +4,15 @@ use num_traits::identities::Zero;
 use tidb_query_codegen::rpn_fn;
 use tidb_query_common::Result;
 use tidb_query_datatype::{
-    codec::{self, Error, data_type::*, div_i64, div_i64_with_u64, div_u64_with_i64, mysql::Res},
+    codec::{
+        self, Error, batch::LazyBatchColumnVec, data_type::*, div_i64, div_i64_with_u64,
+        div_u64_with_i64, mysql::Res,
+    },
     expr::EvalContext,
 };
+use tipb::FieldType;
+
+use crate::RpnExpression;
 
 #[rpn_fn]
 #[inline]
@@ -34,6 +40,200 @@ pub trait ArithmeticOpWithCtx {
     type T: Evaluable + EvaluableRet;
 
     fn calc(ctx: &mut EvalContext, lhs: &Self::T, rhs: &Self::T) -> Result<Option<Self::T>>;
+}
+
+/// A DECIMAL binary arithmetic operation that returns NULL as soon as its left
+/// operand is NULL, so the right operand can be skipped (short-circuited).
+trait DecimalShortCircuitOp {
+    fn calc(ctx: &mut EvalContext, lhs: &Decimal, rhs: &Decimal) -> Result<Option<Decimal>>;
+}
+
+impl DecimalShortCircuitOp for DecimalPlus {
+    #[inline]
+    fn calc(_ctx: &mut EvalContext, lhs: &Decimal, rhs: &Decimal) -> Result<Option<Decimal>> {
+        <DecimalPlus as ArithmeticOp>::calc(lhs, rhs)
+    }
+}
+
+impl DecimalShortCircuitOp for DecimalDivide {
+    #[inline]
+    fn calc(ctx: &mut EvalContext, lhs: &Decimal, rhs: &Decimal) -> Result<Option<Decimal>> {
+        <DecimalDivide as ArithmeticOpWithCtx>::calc(ctx, lhs, rhs)
+    }
+}
+
+impl DecimalShortCircuitOp for DecimalMod {
+    #[inline]
+    fn calc(ctx: &mut EvalContext, lhs: &Decimal, rhs: &Decimal) -> Result<Option<Decimal>> {
+        <DecimalMod as ArithmeticOpWithCtx>::calc(ctx, lhs, rhs)
+    }
+}
+
+/// Reads a nullable decimal value from an evaluated argument at the given
+/// logical (output) index. Errors if the argument does not produce a decimal.
+#[inline]
+fn decimal_arg(arg: &RpnStackNode<'_>, row_index: usize) -> Result<Option<&Decimal>> {
+    match arg.get_logical_scalar_ref(row_index) {
+        tidb_query_datatype::codec::data_type::ScalarValueRef::Decimal(value) => Ok(value),
+        other => Err(other_err!(
+            "DECIMAL arithmetic argument must be decimal, got {}",
+            other.eval_type()
+        )),
+    }
+}
+
+/// Evaluates a two-argument DECIMAL arithmetic operation, skipping the right
+/// operand for rows whose left operand is NULL.
+///
+/// This mirrors TiDB's row-based evaluation and MySQL, which fetch the left
+/// operand first and return NULL without evaluating the right operand. Without
+/// this, a runtime error (for example an overflow) raised by the right operand
+/// would fail the whole statement even though the result is NULL.
+fn eval_decimal_short_circuit<Op: DecimalShortCircuitOp>(
+    ctx: &mut EvalContext,
+    schema: &[FieldType],
+    input_physical_columns: &LazyBatchColumnVec,
+    input_logical_rows: &[usize],
+    output_rows: usize,
+    args: &[RpnExpression],
+) -> Result<VectorValue> {
+    assert_eq!(args.len(), 2);
+    assert!(input_logical_rows.is_empty() || input_logical_rows.len() == output_rows);
+    if output_rows == 0 {
+        return Ok(Decimal::cast_chunk_into_vector_value(
+            ChunkedVecSized::<Decimal>::with_capacity(0),
+        ));
+    }
+
+    let lhs = args[0].eval_decoded(
+        ctx,
+        schema,
+        input_physical_columns,
+        input_logical_rows,
+        output_rows,
+    )?;
+
+    // `pending_positions` holds output indices whose left operand is non-NULL and
+    // therefore still need the right operand evaluated. `pending_logical_rows`
+    // mirrors it with the physical row mapping, and stays empty for the identity
+    // mapping (which only happens when the expression has no column references).
+    let mut pending_positions = Vec::with_capacity(output_rows);
+    let mut pending_logical_rows = if input_logical_rows.is_empty() {
+        Vec::new()
+    } else {
+        Vec::with_capacity(output_rows)
+    };
+    let mut has_null = false;
+    for output_index in 0..output_rows {
+        match decimal_arg(&lhs, output_index)? {
+            Some(_) => {
+                pending_positions.push(output_index);
+                if !input_logical_rows.is_empty() {
+                    pending_logical_rows.push(input_logical_rows[output_index]);
+                }
+            }
+            None => has_null = true,
+        }
+    }
+
+    if !has_null {
+        // Fast path: evaluate the right operand once over the full batch.
+        let rhs = args[1].eval_decoded(
+            ctx,
+            schema,
+            input_physical_columns,
+            input_logical_rows,
+            output_rows,
+        )?;
+        let mut result = ChunkedVecSized::<Decimal>::with_capacity(output_rows);
+        for row_index in 0..output_rows {
+            let lhs_value = decimal_arg(&lhs, row_index)?.unwrap();
+            let value = match decimal_arg(&rhs, row_index)? {
+                Some(rhs_value) => Op::calc(ctx, lhs_value, rhs_value)?,
+                None => None,
+            };
+            result.push(value);
+        }
+        return Ok(Decimal::cast_chunk_into_vector_value(result));
+    }
+
+    // Resolve the NULL left operands immediately; the right operand is only
+    // evaluated for the remaining rows.
+    let mut result = vec![None; output_rows];
+    if !pending_positions.is_empty() {
+        let rhs = args[1].eval_decoded(
+            ctx,
+            schema,
+            input_physical_columns,
+            &pending_logical_rows,
+            pending_positions.len(),
+        )?;
+        for (compact_index, &output_index) in pending_positions.iter().enumerate() {
+            let lhs_value = decimal_arg(&lhs, output_index)?.unwrap();
+            result[output_index] = match decimal_arg(&rhs, compact_index)? {
+                Some(rhs_value) => Op::calc(ctx, lhs_value, rhs_value)?,
+                None => None,
+            };
+        }
+    }
+    Ok(Decimal::cast_chunk_into_vector_value(result.into()))
+}
+
+/// See `eval_decimal_short_circuit`.
+pub fn sc_decimal_plus(
+    ctx: &mut EvalContext,
+    schema: &[FieldType],
+    input_physical_columns: &LazyBatchColumnVec,
+    input_logical_rows: &[usize],
+    output_rows: usize,
+    args: &[RpnExpression],
+) -> Result<VectorValue> {
+    eval_decimal_short_circuit::<DecimalPlus>(
+        ctx,
+        schema,
+        input_physical_columns,
+        input_logical_rows,
+        output_rows,
+        args,
+    )
+}
+
+/// See `eval_decimal_short_circuit`.
+pub fn sc_decimal_divide(
+    ctx: &mut EvalContext,
+    schema: &[FieldType],
+    input_physical_columns: &LazyBatchColumnVec,
+    input_logical_rows: &[usize],
+    output_rows: usize,
+    args: &[RpnExpression],
+) -> Result<VectorValue> {
+    eval_decimal_short_circuit::<DecimalDivide>(
+        ctx,
+        schema,
+        input_physical_columns,
+        input_logical_rows,
+        output_rows,
+        args,
+    )
+}
+
+/// See `eval_decimal_short_circuit`.
+pub fn sc_decimal_mod(
+    ctx: &mut EvalContext,
+    schema: &[FieldType],
+    input_physical_columns: &LazyBatchColumnVec,
+    input_logical_rows: &[usize],
+    output_rows: usize,
+    args: &[RpnExpression],
+) -> Result<VectorValue> {
+    eval_decimal_short_circuit::<DecimalMod>(
+        ctx,
+        schema,
+        input_physical_columns,
+        input_logical_rows,
+        output_rows,
+        args,
+    )
 }
 
 #[derive(Debug)]

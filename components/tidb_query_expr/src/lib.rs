@@ -983,6 +983,21 @@ fn map_expr_node_to_sc_func(expr: &Expr) -> Option<ShortCircuitFnMeta> {
             sig: ScalarFuncSig::LogicalAnd,
             fn_ptr: sc_logical_and,
         }),
+        // DECIMAL arithmetic returns NULL as soon as its left operand is NULL,
+        // matching TiDB's row-based evaluation, so short-circuit the remaining
+        // (right) operand rather than letting its runtime error abort the query.
+        ScalarFuncSig::PlusDecimal => Some(ShortCircuitFnMeta {
+            sig: ScalarFuncSig::PlusDecimal,
+            fn_ptr: sc_decimal_plus,
+        }),
+        ScalarFuncSig::DivideDecimal => Some(ShortCircuitFnMeta {
+            sig: ScalarFuncSig::DivideDecimal,
+            fn_ptr: sc_decimal_divide,
+        }),
+        ScalarFuncSig::ModDecimal => Some(ShortCircuitFnMeta {
+            sig: ScalarFuncSig::ModDecimal,
+            fn_ptr: sc_decimal_mod,
+        }),
         // TODO: Support IF, IFNULL, CASE WHEN, COALESCE, etc.
         _ => None,
     }

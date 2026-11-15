@@ -857,6 +857,107 @@ mod tests {
         );
     }
 
+    /// DECIMAL arithmetic must short-circuit the right operand when the left
+    /// operand is NULL, matching TiDB's row-based evaluation and MySQL. This
+    /// reproduces the issue #20319 scenario at the expression level.
+    #[test]
+    fn test_decimal_arithmetic_short_circuits_null_lhs() {
+        use tipb::{Expr, ScalarFuncSig};
+
+        // The right operand raises an overflow (1690) if it is evaluated. It must
+        // not be evaluated for rows whose left operand is NULL.
+        fn build_overflow_rhs() -> Expr {
+            // `0.1e1 * 0.1e1` overflows a tiny DECIMAL(1,0) ... use a plain
+            // overflow: the largest DECIMAL(65,0) value squared overflows.
+            let big = "99999999999999999999999999999999999999999999999999999999999999999";
+            ExprDefBuilder::scalar_func(ScalarFuncSig::MultiplyDecimal, FieldTypeTp::NewDecimal)
+                .push_child(ExprDefBuilder::constant_decimal(big.parse().unwrap()))
+                .push_child(ExprDefBuilder::constant_decimal(big.parse().unwrap()))
+                .build()
+        }
+
+        fn run_case(
+            sig: ScalarFuncSig,
+            lhs: &[Option<Decimal>],
+            rhs: Expr,
+            logical_rows: &[usize],
+            expected: &[Option<Decimal>],
+        ) {
+            let node = ExprDefBuilder::scalar_func(sig, FieldTypeTp::NewDecimal)
+                .push_child(ExprDefBuilder::column_ref(0, FieldTypeTp::NewDecimal))
+                .push_child(rhs)
+                .build();
+            let mut ctx = short_circuit_context();
+            let exp = RpnExpressionBuilder::build_from_expr_tree(node, &mut ctx, 1).unwrap();
+            let mut columns = LazyBatchColumnVec::from(vec![{
+                let mut col = LazyBatchColumn::decoded_with_capacity_and_tp(
+                    lhs.len(),
+                    EvalType::Decimal,
+                );
+                for value in lhs {
+                    col.mut_decoded().push_decimal(*value);
+                }
+                col
+            }]);
+            let schema = &[FieldTypeTp::NewDecimal.into()];
+
+            let result = exp
+                .eval(
+                    &mut ctx,
+                    schema,
+                    &mut columns,
+                    logical_rows,
+                    logical_rows.len(),
+                )
+                .unwrap();
+            assert_eq!(
+                result.vector_value().unwrap().as_ref().to_decimal_vec(),
+                expected
+            );
+        }
+
+        let overflow_rhs = build_overflow_rhs();
+
+        for sig in [
+            ScalarFuncSig::PlusDecimal,
+            ScalarFuncSig::DivideDecimal,
+            ScalarFuncSig::ModDecimal,
+        ] {
+            // All NULL: the overflowing right operand must not be evaluated, so the
+            // expression succeeds and yields NULL instead of raising an overflow.
+            run_case(sig, &[None, None], overflow_rhs.clone(), &[0, 1], &[None, None]);
+
+            // Mixed rows: NULL left operands are resolved without evaluating the
+            // right operand; non-NULL left operands still evaluate (and error on)
+            // the overflowing right operand.
+            let lhs = [Some(Decimal::from(1u64)), None, Some(Decimal::from(2u64))];
+            let result = {
+                let node = ExprDefBuilder::scalar_func(sig, FieldTypeTp::NewDecimal)
+                    .push_child(ExprDefBuilder::column_ref(0, FieldTypeTp::NewDecimal))
+                    .push_child(overflow_rhs.clone())
+                    .build();
+                let mut ctx = short_circuit_context();
+                let exp = RpnExpressionBuilder::build_from_expr_tree(node, &mut ctx, 1).unwrap();
+                let mut columns = LazyBatchColumnVec::from(vec![{
+                    let mut col =
+                        LazyBatchColumn::decoded_with_capacity_and_tp(lhs.len(), EvalType::Decimal);
+                    for value in &lhs {
+                        col.mut_decoded().push_decimal(*value);
+                    }
+                    col
+                }]);
+                exp.eval(
+                    &mut ctx,
+                    &[FieldTypeTp::NewDecimal.into()],
+                    &mut columns,
+                    &[0, 1, 2],
+                    lhs.len(),
+                )
+            };
+            assert!(result.is_err(), "sig={:?}", sig);
+        }
+    }
+
     /// Creates fixture to be used in `test_eval_single_column_node_xxx`.
     fn new_single_column_node_fixture() -> (LazyBatchColumnVec, Vec<usize>, [FieldType; 2]) {
         let physical_columns = LazyBatchColumnVec::from(vec![
