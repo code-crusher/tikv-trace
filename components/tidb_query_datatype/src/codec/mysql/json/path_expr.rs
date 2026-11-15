@@ -214,7 +214,7 @@ pub const PATH_EXPRESSION_CONTAINS_RANGE: PathExpressionFlag = 0x04;
 
 fn path_expression(input: &str) -> IResult<&str, PathExpression> {
     let mut flags = PathExpressionFlag::default();
-    let (input, (_, _, legs)) = tuple((
+    let (input, (_, _, legs, _)) = tuple((
         space0,
         char('$'),
         many0(delimited(
@@ -226,6 +226,7 @@ fn path_expression(input: &str) -> IResult<&str, PathExpression> {
             )),
             space0,
         )),
+        space0,
     ))(input)?;
 
     for leg in legs.iter() {
@@ -330,6 +331,22 @@ mod tests {
         let mut test_cases = vec![
             (
                 "$",
+                None,
+                Some(PathExpression {
+                    legs: vec![],
+                    flags: PathExpressionFlag::default(),
+                }),
+            ),
+            (
+                "$   ",
+                None,
+                Some(PathExpression {
+                    legs: vec![],
+                    flags: PathExpressionFlag::default(),
+                }),
+            ),
+            (
+                "   $   ",
                 None,
                 Some(PathExpression {
                     legs: vec![],
