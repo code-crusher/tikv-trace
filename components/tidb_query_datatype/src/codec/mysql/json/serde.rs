@@ -12,7 +12,7 @@ use serde_json::{
 };
 
 use super::{Json, JsonRef, JsonType};
-use crate::codec::{Error, convert::ToStringValue};
+use crate::codec::{Error, convert::ToStringValue, error::JSON_OBJECT_KEY_TOO_LONG_MSG};
 
 /// MySQL formatter follows the implementation in TiDB
 /// https://github.com/pingcap/tidb/blob/master/types/json/binary.go
@@ -188,6 +188,14 @@ impl FromStr for Json {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match serde_json::from_str(s) {
             Ok(value) => Ok(value),
+            // `serde_json` only keeps the message of an error raised while
+            // visiting the JSON document, so the error code has to be
+            // recovered from the message here. Keep the key-too-long error
+            // instead of reporting it as an illegal JSON text, so that the
+            // coprocessor returns the same error code as TiDB.
+            Err(e) if e.to_string().contains(JSON_OBJECT_KEY_TOO_LONG_MSG) => {
+                Err(Error::json_object_key_too_long())
+            }
             Err(e) => Err(invalid_type!("Illegal Json text: {:?}", e)),
         }
     }
@@ -282,7 +290,7 @@ impl<'de> Deserialize<'de> for Json {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FieldTypeTp;
+    use crate::{FieldTypeTp, codec::error::ERR_JSON_OBJECT_KEY_TOO_LONG};
 
     #[test]
     fn test_from_str_for_object() {
@@ -334,6 +342,22 @@ mod tests {
         for json_str in illegal_cases {
             let resp = Json::from_str(json_str);
             resp.unwrap_err();
+        }
+    }
+
+    #[test]
+    fn test_from_str_with_too_long_object_key() {
+        let max_key = "a".repeat(u16::MAX as usize);
+        Json::from_str(&format!(r#"{{"{}": 1}}"#, max_key)).unwrap();
+
+        let too_long_key = "a".repeat(u16::MAX as usize + 1);
+        let err = Json::from_str(&format!(r#"{{"{}": 1}}"#, too_long_key)).unwrap_err();
+        match err {
+            Error::Eval(msg, code) => {
+                assert_eq!(code, ERR_JSON_OBJECT_KEY_TOO_LONG);
+                assert_eq!(msg, JSON_OBJECT_KEY_TOO_LONG_MSG);
+            }
+            _ => panic!("unexpected error: {:?}", err),
         }
     }
 

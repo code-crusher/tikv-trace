@@ -25,6 +25,12 @@ pub const ERR_DATETIME_FUNCTION_OVERFLOW: i32 = 1441;
 pub const ERR_INCORRECT_PARAMETERS: i32 = 1583;
 pub const ERR_DATA_OUT_OF_RANGE: i32 = 1690;
 pub const ERR_CANNOT_CONVERT_STRING: i32 = 3854;
+pub const ERR_JSON_OBJECT_KEY_TOO_LONG: i32 = 8129;
+
+/// The message TiDB reports for [`ERR_JSON_OBJECT_KEY_TOO_LONG`], see
+/// `ErrJSONObjectKeyTooLong` in TiDB `pkg/errno/errname.go`.
+pub const JSON_OBJECT_KEY_TOO_LONG_MSG: &str =
+    "TiDB does not yet support JSON objects with the key length >= 65536";
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -99,6 +105,13 @@ impl Error {
     pub fn cannot_convert_string(s: &str, charset: &str) -> Error {
         let msg = format!("Cannot convert string {} from binary to {}", s, charset);
         Error::Eval(msg, ERR_CANNOT_CONVERT_STRING)
+    }
+
+    pub fn json_object_key_too_long() -> Error {
+        Error::Eval(
+            JSON_OBJECT_KEY_TOO_LONG_MSG.into(),
+            ERR_JSON_OBJECT_KEY_TOO_LONG,
+        )
     }
 
     pub fn datetime_function_overflow() -> Error {

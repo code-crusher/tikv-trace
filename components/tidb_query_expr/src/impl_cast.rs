@@ -1616,6 +1616,7 @@ mod tests {
         sync::Arc,
     };
 
+    use tidb_query_common::error::{ErrorInner, EvaluateError};
     use tidb_query_datatype::{
         Collation, FieldTypeFlag, FieldTypeTp, UNSPECIFIED_LENGTH,
         builder::FieldTypeBuilder,
@@ -1623,7 +1624,8 @@ mod tests {
             convert::produce_dec_with_specified_tp,
             data_type::{Bytes, Int, Real},
             error::{
-                ERR_DATA_OUT_OF_RANGE, ERR_DATA_TOO_LONG, ERR_TRUNCATE_WRONG_VALUE, ERR_UNKNOWN,
+                ERR_DATA_OUT_OF_RANGE, ERR_DATA_TOO_LONG, ERR_JSON_OBJECT_KEY_TOO_LONG,
+                ERR_TRUNCATE_WRONG_VALUE, ERR_UNKNOWN, JSON_OBJECT_KEY_TOO_LONG_MSG,
                 WARN_DATA_TRUNCATED,
             },
             mysql::{
@@ -7068,6 +7070,43 @@ mod tests {
                 input, parse_to_json, expect, result_str
             );
             check_result(Some(&expect), &result, log.as_str());
+        }
+    }
+
+    #[test]
+    fn test_string_as_json_with_too_long_object_key() {
+        let arg_type = FieldType::default();
+        let mut rft = FieldType::default();
+        let fta = rft.as_mut_accessor();
+        fta.set_flag(FieldTypeFlag::PARSE_TO_JSON);
+        let extra = make_extra(&rft);
+
+        // A JSON object key of exactly `u16::MAX` bytes is still accepted.
+        let input = format!(r#"{{"{}": 0}}"#, "a".repeat(u16::MAX as usize));
+        let arg_value = ScalarValue::Bytes(Some(input.clone().into_bytes()));
+        let args = [RpnStackNode::Scalar {
+            value: &arg_value,
+            field_type: &arg_type,
+        }];
+        let result = cast_string_as_json(&args, &extra, Some(&input.into_bytes()));
+        assert!(result.is_ok(), "{:?}", result);
+
+        // A longer key must fail with the same error code as TiDB instead of
+        // being encoded with a wrapped-around key length.
+        let input = format!(r#"{{"{}": 0}}"#, "a".repeat(u16::MAX as usize + 1));
+        let arg_value = ScalarValue::Bytes(Some(input.clone().into_bytes()));
+        let args = [RpnStackNode::Scalar {
+            value: &arg_value,
+            field_type: &arg_type,
+        }];
+        let result = cast_string_as_json(&args, &extra, Some(&input.into_bytes()));
+        let err = result.unwrap_err();
+        match *err.0 {
+            ErrorInner::Evaluate(EvaluateError::Custom { code, msg }) => {
+                assert_eq!(code, ERR_JSON_OBJECT_KEY_TOO_LONG);
+                assert_eq!(msg, JSON_OBJECT_KEY_TOO_LONG_MSG);
+            }
+            _ => panic!("unexpected error: {:?}", err),
         }
     }
 

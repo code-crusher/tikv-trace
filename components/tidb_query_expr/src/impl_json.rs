@@ -312,8 +312,12 @@ fn json_valid(args: &[ScalarValueRef]) -> Result<Option<Int>> {
                 Some(p) => {
                     let tmp_str =
                         std::str::from_utf8(p).map_err(tidb_query_datatype::codec::Error::from)?;
-                    let json: serde_json::error::Result<Json> = serde_json::from_str(tmp_str);
-                    Some(json.is_ok() as Int)
+                    // Only check that the text is syntactically valid, like
+                    // TiDB does with `encoding/json.Valid`. Decoding it into a
+                    // `Json` would also enforce the binary encoding limits,
+                    // e.g. the object key length limit.
+                    let valid = serde_json::from_str::<IgnoredAny>(tmp_str).is_ok();
+                    Some(valid as Int)
                 }
                 _ => Some(0),
             },
@@ -990,6 +994,15 @@ mod tests {
             (vec![Some(b"2.5".to_vec()).into()], Some(1)),
             (vec![Some(b"2019-8-19".to_vec()).into()], Some(0)),
             (vec![Some(b"\"2019-8-19\"".to_vec()).into()], Some(1)),
+            // `JSON_VALID` only checks the text is syntactically valid, so an
+            // object key longer than the binary encoding limit is still valid.
+            (
+                vec![
+                    Some(format!(r#"{{"{}":1}}"#, "a".repeat(u16::MAX as usize + 1)).into_bytes())
+                        .into(),
+                ],
+                Some(1),
+            ),
             (vec![Some(2).into()], Some(0)),
             (vec![Some(2.5).into()], Some(0)),
             (vec![None::<Json>.into()], None),
