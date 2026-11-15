@@ -245,7 +245,9 @@ mod test {
         assert_eq!(COUNTER.load(Ordering::SeqCst), threads.size() + 1);
 
         threads.adjust_with(8);
-        assert!(!threads.gc_runtime.tracker.is_empty());
+        // The tracked GC task may complete as soon as it is spawned, so the
+        // tracker being non-empty here is not guaranteed. Its completion is
+        // verified below instead.
         assert_eq!(COUNTER.load(Ordering::SeqCst), threads.size());
 
         sleep(Duration::from_secs(1));
