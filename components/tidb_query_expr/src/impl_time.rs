@@ -36,8 +36,6 @@ pub fn date_format(
     t: Option<&DateTime>,
     layout: Option<BytesRef>,
 ) -> Result<Option<Bytes>> {
-    use std::str::from_utf8;
-
     if t.is_none() || layout.is_none() {
         return Ok(None);
     }
@@ -48,7 +46,8 @@ pub fn date_format(
             .map(|_| Ok(None))?;
     }
 
-    let t = t.date_format(from_utf8(layout).map_err(Error::Encoding)?);
+    let layout = String::from_utf8_lossy(layout);
+    let t = t.date_format(&layout);
     if let Err(err) = t {
         return ctx.handle_invalid_time_error(err).map(|_| Ok(None))?;
     }
@@ -1542,7 +1541,7 @@ pub fn from_unixtime_2_arg(
     let t = eval_from_unixtime(ctx, extra.ret_field_type.get_decimal() as i8, *arg0)?;
     match t {
         Some(t) => {
-            let res = t.date_format(std::str::from_utf8(arg1).map_err(Error::Encoding)?)?;
+            let res = t.date_format(&String::from_utf8_lossy(arg1))?;
             Ok(Some(res.into()))
         }
         None => Ok(None),
@@ -2019,6 +2018,29 @@ mod tests {
                 .evaluate(ScalarFuncSig::DateFormatSig)
                 .unwrap();
             assert_eq!(output, expect, "{:?} {:?}", date, format);
+        }
+
+        // The format may contain invalid UTF-8 bytes. TiDB's DateFormat iterates
+        // over the format by rune and emits U+FFFD for invalid bytes instead of
+        // failing, so TiKV must behave the same way. See issue #20315.
+        {
+            let format = Some(vec![0x80, b'%', b'Y', 0x80]);
+            // 0x80 -> U+FFFD, %Y -> year, 0x80 -> U+FFFD
+            let expect = Some("\u{FFFD}2020\u{FFFD}".as_bytes().to_vec());
+            let output = RpnFnScalarEvaluator::new()
+                .push_param(Some(
+                    DateTime::parse_datetime(
+                        &mut EvalContext::default(),
+                        "2020-01-02 03:04:05",
+                        6,
+                        true,
+                    )
+                    .unwrap(),
+                ))
+                .push_param(format)
+                .evaluate::<Bytes>(ScalarFuncSig::DateFormatSig)
+                .unwrap();
+            assert_eq!(output, expect);
         }
 
         // TODO: pass this test after refactoring the issue #3953 is fixed.
