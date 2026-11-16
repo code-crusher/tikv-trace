@@ -1007,6 +1007,33 @@ mod tests {
     }
 
     #[test]
+    fn test_json_contains_with_invalid_path() {
+        // Issue #20316: a quoted path key containing an escape that is not a
+        // valid JSON escape (e.g. `\q`) must be rejected as an invalid JSON
+        // path expression, consistent with TiDB's `json.Valid` check.
+        let vargs: Vec<ScalarValue> = vec![
+            Some(Json::from_str(r#"{"q":1}"#).unwrap()).into(),
+            Some(Json::from_str(r#"1"#).unwrap()).into(),
+            Some(b"$.\"\\q\"".to_vec()).into(),
+        ];
+        let output: Result<Option<i64>> = RpnFnScalarEvaluator::new()
+            .push_params(vargs.clone())
+            .evaluate(ScalarFuncSig::JsonContainsSig);
+        assert!(output.is_err(), "{:?}", vargs);
+
+        // a valid escaped key should still be accepted
+        let vargs: Vec<ScalarValue> = vec![
+            Some(Json::from_str(r#"{"q":1}"#).unwrap()).into(),
+            Some(Json::from_str(r#"1"#).unwrap()).into(),
+            Some(b"$.\"\\u0071\"".to_vec()).into(),
+        ];
+        let output: Result<Option<i64>> = RpnFnScalarEvaluator::new()
+            .push_params(vargs.clone())
+            .evaluate(ScalarFuncSig::JsonContainsSig);
+        assert_eq!(output.unwrap(), Some(1), "{:?}", vargs);
+    }
+
+    #[test]
     fn test_json_contains() {
         let cases: Vec<(Vec<ScalarValue>, Option<i64>)> = vec![
             (

@@ -38,6 +38,8 @@ use nom::{
     sequence::{delimited, pair, tuple},
 };
 
+use serde::de::IgnoredAny;
+
 use super::json_unquote::unquote_string;
 use crate::codec::Result;
 
@@ -47,6 +49,19 @@ fn lift_error_to_failure<E>(err: nom::Err<E>) -> nom::Err<E> {
     } else {
         err
     }
+}
+
+/// Checks whether the raw content of a quoted key is a valid JSON string
+/// body, mirroring the `json.Valid` check in TiDB's `parseJSONPathMember`
+/// (`types/json_path_expr.go`), which rejects a quoted key when the key
+/// wrapped in quotes is not valid JSON. This rejects escape sequences that
+/// are not valid JSON escapes, e.g. `\q` in `$."\q"`.
+fn is_valid_json_string_body(raw: &str) -> bool {
+    let mut quoted = String::with_capacity(raw.len().saturating_add(2));
+    quoted.push('"');
+    quoted.push_str(raw);
+    quoted.push('"');
+    serde_json::from_str::<IgnoredAny>(&quoted).is_ok()
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -152,6 +167,12 @@ fn key_selection_key(input: &str) -> IResult<&str, KeySelection> {
         delimited(char('"'), many1(none_of("\"")), char('"')),
         |key: Vec<_>| {
             let key: String = key.into_iter().collect();
+            // The raw key must be valid as the body of a JSON string, otherwise
+            // escapes like `\q` would silently be accepted with the backslash
+            // dropped. This matches the `json.Valid` check done by TiDB.
+            if !is_valid_json_string_body(&key) {
+                return None;
+            }
             let key = unquote_string(&key).ok()?;
             for ch in key.chars() {
                 if ch.is_control() {
@@ -364,6 +385,38 @@ mod tests {
                 }),
             ),
             (
+                "$.\"\\u597d\"",
+                None,
+                Some(PathExpression {
+                    legs: vec![PathLeg::Key(KeySelection::Key(String::from("好")))],
+                    flags: PathExpressionFlag::default(),
+                }),
+            ),
+            (
+                "$.\"\\u0061bc\"",
+                None,
+                Some(PathExpression {
+                    legs: vec![PathLeg::Key(KeySelection::Key(String::from("abc")))],
+                    flags: PathExpressionFlag::default(),
+                }),
+            ),
+            (
+                "$.\"\\\\\"",
+                None,
+                Some(PathExpression {
+                    legs: vec![PathLeg::Key(KeySelection::Key(String::from("\\")))],
+                    flags: PathExpressionFlag::default(),
+                }),
+            ),
+            (
+                "$.\"\\/\"",
+                None,
+                Some(PathExpression {
+                    legs: vec![PathLeg::Key(KeySelection::Key(String::from("/")))],
+                    flags: PathExpressionFlag::default(),
+                }),
+            ),
+            (
                 "$.  \"你好 世界\"  ",
                 None,
                 Some(PathExpression {
@@ -517,6 +570,26 @@ mod tests {
             ),
             (
                 "$.\"\\u33\"",
+                Some("Invalid JSON path expression. The error is around character position 3."),
+                None,
+            ),
+            (
+                "$.\"\\q\"",
+                Some("Invalid JSON path expression. The error is around character position 3."),
+                None,
+            ),
+            (
+                "$.\"a\\qb\"",
+                Some("Invalid JSON path expression. The error is around character position 3."),
+                None,
+            ),
+            (
+                "$.\"\\u41\"",
+                Some("Invalid JSON path expression. The error is around character position 3."),
+                None,
+            ),
+            (
+                "$.\"\\x41\"",
                 Some("Invalid JSON path expression. The error is around character position 3."),
                 None,
             ),
