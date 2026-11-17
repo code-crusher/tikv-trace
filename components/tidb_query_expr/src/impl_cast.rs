@@ -1072,10 +1072,10 @@ fn cast_bytes_like_as_time(
     extra: &RpnFnCallExtra,
     val: &[u8],
 ) -> Result<Option<Time>> {
-    let val = std::str::from_utf8(val).map_err(Error::Encoding)?;
+    let val = String::from_utf8_lossy(val);
     let result = Time::parse(
         ctx,
-        val,
+        &val,
         extra.ret_field_type.as_accessor().tp().try_into()?,
         extra.ret_field_type.get_decimal() as i8,
         true,
@@ -1616,6 +1616,7 @@ mod tests {
         sync::Arc,
     };
 
+    use tidb_query_common::error::EvaluateError;
     use tidb_query_datatype::{
         Collation, FieldTypeFlag, FieldTypeTp, UNSPECIFIED_LENGTH,
         builder::FieldTypeBuilder,
@@ -1630,6 +1631,7 @@ mod tests {
                 Decimal, Duration, Json, MAX_FSP, MIN_FSP, RoundMode, Time, TimeType, Tz,
                 charset::*,
                 decimal::{max_decimal, max_or_min_dec},
+                json::JsonType,
             },
         },
         expr::{EvalConfig, EvalContext, Flag},
@@ -6837,6 +6839,119 @@ mod tests {
             let r = cast_json_as_time(&mut ctx, &extra, Some(input.as_ref()));
             let log = make_log(&input, &expect, &r);
             check_result(Some(&expect), &r, log.as_str());
+        }
+    }
+
+    // Tests that casting a JSON string containing invalid UTF-8 bytes (e.g.
+    // produced from a latin1 column value via `cast_string_as_json`) to a
+    // time type doesn't fail with an encoding error. It should behave like
+    // TiDB: produce a warning and a NULL value.
+    // See issue #20314.
+    #[test]
+    fn test_json_as_time_invalid_utf8() {
+        // Build a JSON string whose bytes are invalid UTF-8, like
+        // `cast_string_as_json` does for a latin1 0xFF byte: a one-byte
+        // length prefix followed by the raw byte.
+        let input = Json::new(JsonType::String, vec![1, 0xFF]);
+
+        for truncate_as_warning in [true, false] {
+            let mut ctx: EvalContext = CtxConfig {
+                truncate_as_warning,
+                ..CtxConfig::default()
+            }
+            .into();
+            let rft = FieldTypeConfig {
+                tp: Some(FieldTypeTp::DateTime),
+                ..FieldTypeConfig::default()
+            }
+            .into();
+            let extra = make_extra(&rft);
+
+            let result = cast_json_as_time(&mut ctx, &extra, Some(input.as_ref()));
+            let log = format!(
+                "input: {:?}, result: {:?}, warnings: {:?}",
+                input, result, ctx.warnings.warnings
+            );
+            match truncate_as_warning {
+                // The invalid byte no longer aborts the statement: the
+                // conversion only fails to produce a valid datetime, which is
+                // reported as a warning (like TiDB) with a NULL result.
+                true => {
+                    assert!(result.is_ok(), "{}", log);
+                    assert!(result.as_ref().unwrap().is_none(), "{}", log);
+                    assert_eq!(ctx.warnings.warning_cnt, 1, "{}", log);
+                    assert_eq!(
+                        ctx.warnings.warnings[0].get_code(),
+                        ERR_TRUNCATE_WRONG_VALUE,
+                        "{}",
+                        log
+                    );
+                }
+                // The conversion fails as a truncate error instead of an
+                // encoding error.
+                false => {
+                    let e = result.unwrap_err();
+                    let tidb_query_common::error::ErrorInner::Evaluate(EvaluateError::Custom {
+                        code,
+                        ..
+                    }) = *e.0
+                    else {
+                        panic!("{}", log);
+                    };
+                    assert_eq!(code, ERR_TRUNCATE_WRONG_VALUE, "{}", log);
+                }
+            }
+        }
+    }
+
+    // Tests that casting a string containing invalid UTF-8 bytes to a time
+    // type doesn't fail with an encoding error, but produces a warning and
+    // a NULL value, like `cast_string_as_duration` does.
+    // See issue #20314.
+    #[test]
+    fn test_string_as_time_invalid_utf8() {
+        for truncate_as_warning in [true, false] {
+            let mut ctx: EvalContext = CtxConfig {
+                truncate_as_warning,
+                ..CtxConfig::default()
+            }
+            .into();
+            let rft = FieldTypeConfig {
+                tp: Some(FieldTypeTp::DateTime),
+                ..FieldTypeConfig::default()
+            }
+            .into();
+            let extra = make_extra(&rft);
+
+            let result = cast_string_as_time(&mut ctx, &extra, Some(&b"\xFF"[..]));
+            let log = format!(
+                "input: {:?}, result: {:?}, warnings: {:?}",
+                b"\xFF", result, ctx.warnings.warnings
+            );
+            match truncate_as_warning {
+                // The invalid byte no longer aborts the statement: the
+                // conversion only fails to produce a valid datetime, which is
+                // reported as a warning (like TiDB) with a NULL result.
+                true => {
+                    assert!(result.is_ok(), "{}", log);
+                    assert!(result.as_ref().unwrap().is_none(), "{}", log);
+                    assert_eq!(ctx.warnings.warning_cnt, 1, "{}", log);
+                    assert_eq!(
+                        ctx.warnings.warnings[0].get_code(),
+                        ERR_TRUNCATE_WRONG_VALUE,
+                        "{}",
+                        log
+                    );
+                }
+                // The conversion still doesn't fail the statement (the
+                // truncate error is handled by `handle_invalid_time_error`,
+                // which only turns it into an error in strict mode).
+                false => {
+                    assert!(result.is_ok(), "{}", log);
+                    assert!(result.as_ref().unwrap().is_none(), "{}", log);
+                    assert_eq!(ctx.warnings.warning_cnt, 1, "{}", log);
+                }
+            }
         }
     }
 

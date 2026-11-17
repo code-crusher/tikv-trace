@@ -1,6 +1,6 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{char, str};
+use std::char;
 
 use super::{super::Result, JsonRef, JsonType};
 use crate::codec::convert::ToStringValue;
@@ -19,11 +19,18 @@ impl JsonRef<'_> {
     /// json-unquote-character-escape-sequences
     ///
     /// See `Unquote()` in TiDB `json/binary_function.go`
+    ///
+    /// Note that a JSON string value may contain invalid UTF-8 bytes (see
+    /// `cast_string_as_json` in TiKV, which builds JSON strings from raw
+    /// bytes). Unlike `get_str`, the invalid bytes are replaced with
+    /// `U+FFFD` here rather than failing, so that converting such a JSON
+    /// string to a time/duration value reports a warning and returns NULL
+    /// like TiDB instead of failing the whole statement (see issue #20314).
     pub fn unquote(&self) -> Result<String> {
         match self.get_type() {
             JsonType::String => {
-                let s = self.get_str()?;
-                unquote_string(s)
+                let s = String::from_utf8_lossy(self.get_str_bytes()?);
+                unquote_string(&s)
             }
             JsonType::Date
             | JsonType::Datetime
@@ -178,6 +185,19 @@ mod tests {
                 i, expected, got
             );
         }
+    }
+
+    #[test]
+    fn test_json_unquote_with_invalid_utf8() {
+        // A JSON string created by `cast_string_as_json` may contain invalid
+        // UTF-8 bytes (e.g. from a latin1 column). Unquoting it should not
+        // fail; the invalid bytes are replaced by U+FFFD, following the
+        // warning-instead-of-error behavior of TiDB. See issue #20314.
+        //
+        // The value is the binary encoding of the JSON string "\xFF", i.e.
+        // a one-byte length prefix followed by the raw (invalid UTF-8) byte.
+        let j = Json::new(JsonType::String, vec![1, 0xFF]);
+        assert_eq!(j.as_ref().unquote().unwrap(), "\u{FFFD}");
     }
 
     #[test]
