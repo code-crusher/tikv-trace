@@ -406,6 +406,15 @@ impl Json {
         Ok(Self::new(JsonType::Object, value))
     }
 
+    /// Creates a `object` JSON from key-value pairs in BTreeMap, whose keys
+    /// are raw bytes and not necessarily valid UTF-8 (e.g. a latin1 key
+    /// inserted by TiDB via `JSON_OBJECT(_latin1 X'FF', 1)`).
+    pub fn from_object_map(map: BTreeMap<Vec<u8>, Json>) -> Result<Self> {
+        let mut value = vec![];
+        value.write_json_obj_from_map(&map)?;
+        Ok(Self::new(JsonType::Object, value))
+    }
+
     /// Creates a date/datetime/timestamp JSON from Time
     pub fn from_time(time: Time) -> Result<Self> {
         let json_type = match time.get_time_type() {

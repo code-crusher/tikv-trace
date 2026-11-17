@@ -77,6 +77,15 @@ pub trait JsonEncoder: NumberEncoder {
     }
 
     // See `appendBinaryObject` in TiDB `types/json/binary.go`
+    fn write_json_obj_from_map(&mut self, data: &BTreeMap<Vec<u8>, Json>) -> Result<()> {
+        let entries = data
+            .iter()
+            .map(|(key, val)| (key.as_slice(), val.as_ref()))
+            .collect::<Vec<_>>();
+        self.write_json_obj_from_keys_values(entries)
+    }
+
+    // See `appendBinaryObject` in TiDB `types/json/binary.go`
     fn write_json_obj(&mut self, data: &BTreeMap<String, Json>) -> Result<()> {
         // object: element-count size key-entry* value-entry* key* value*
         let element_count = data.len();

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use super::{Json, JsonRef, JsonType};
-use crate::codec::{Error, Result};
+use crate::codec::Result;
 
 impl Json {
     /// `merge` is the implementation for JSON_MERGE in mysql
@@ -51,40 +51,39 @@ impl Json {
         if patch.get_type() != JsonType::Object {
             Ok(patch.to_owned())
         } else {
-            let mut key_val_map: BTreeMap<String, Json> = BTreeMap::new();
+            // Object keys are not necessarily valid UTF-8 (e.g. a latin1 key
+            // inserted by `JSON_OBJECT(_latin1 X'FF', 1)` in TiDB), so they are
+            // kept as raw bytes here, like TiDB does with `string(key)`.
+            // See <https://github.com/tikv/tikv/issues/20313>
+            let mut key_val_map: BTreeMap<Vec<u8>, Json> = BTreeMap::new();
             if target.get_type() == JsonType::Object {
                 let elem_count = target.get_elem_count();
                 for i in 0..elem_count {
                     let key = target.object_get_key(i);
                     let val = target.object_get_val(i)?;
-                    let key = String::from_utf8(key.to_owned()).map_err(Error::from)?;
-                    key_val_map.insert(key, val.to_owned());
+                    key_val_map.insert(key.to_owned(), val.to_owned());
                 }
             }
 
             let mut tmp: Json;
             let elem_count = patch.get_elem_count();
             for i in 0..elem_count {
-                let key = patch.object_get_key(i);
+                let key = patch.object_get_key(i).to_owned();
                 let val = patch.object_get_val(i)?;
-                let k = String::from_utf8(key.to_owned()).map_err(Error::from)?;
 
                 if val.get_type() == JsonType::Literal && val.get_literal().is_none() {
-                    if key_val_map.contains_key(&k) {
-                        key_val_map.remove(&k);
-                    }
+                    key_val_map.remove(&key);
                 } else {
-                    let target_kv = key_val_map.get(&k);
+                    let target_kv = key_val_map.get(&key);
                     if let Some(target_kv) = target_kv {
                         tmp = Self::merge_patch(target_kv.as_ref(), val)?;
-                        key_val_map.insert(k, tmp);
                     } else {
                         tmp = Self::merge_patch(Json::from_bool(false).unwrap().as_ref(), val)?;
-                        key_val_map.insert(k, tmp);
                     }
+                    key_val_map.insert(key, tmp);
                 }
             }
-            Json::from_object(key_val_map)
+            Json::from_object_map(key_val_map)
         }
     }
 }
@@ -128,13 +127,12 @@ fn merge_binary_array(elems: &[MergeUnit<'_>]) -> Result<Json> {
 
 // See `mergeBinaryObject()` in TiDB `json/binary_function.go`
 fn merge_binary_object(objects: &mut Vec<JsonRef<'_>>) -> Result<Json> {
-    let mut kv_map: BTreeMap<String, Json> = BTreeMap::new();
+    let mut kv_map: BTreeMap<Vec<u8>, Json> = BTreeMap::new();
     for j in objects.drain(..) {
         let elem_count = j.get_elem_count();
         for i in 0..elem_count {
-            let key = j.object_get_key(i);
+            let key = j.object_get_key(i).to_owned();
             let val = j.object_get_val(i)?;
-            let key = String::from_utf8(key.to_owned()).map_err(Error::from)?;
             if let Some(old) = kv_map.remove(&key) {
                 let new = Json::merge(vec![old.as_ref(), val])?;
                 kv_map.insert(key, new);
@@ -143,12 +141,76 @@ fn merge_binary_object(objects: &mut Vec<JsonRef<'_>>) -> Result<Json> {
             }
         }
     }
-    Json::from_object(kv_map)
+    Json::from_object_map(kv_map)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_merge_patch() {
+        // See `mergePatchBinaryJSON()` in TiDB `pkg/types/json_binary_functions.go`
+        let cases = vec![
+            (r#"{"a": 1}"#, r#"{"b": 2}"#, r#"{"a": 1, "b": 2}"#),
+            (r#"{"a": 1}"#, r#"{"a": 2}"#, r#"{"a": 2}"#),
+            (
+                r#"{"a": 1, "b": {"c": 2}}"#,
+                r#"{"b": {"d": 3}}"#,
+                r#"{"a": 1, "b": {"c": 2, "d": 3}}"#,
+            ),
+            (r#"{"a": 1}"#, r#"{"a": null}"#, r#"{}"#),
+            (r#"{"a": 1}"#, r#"{}"#, r#"{"a": 1}"#),
+            (r#"{}"#, r#"{"a": 1}"#, r#"{"a": 1}"#),
+            (r#"{"a": 1}"#, r#"null"#, r#"null"#),
+            (r#"{"a": 1}"#, r#"4"#, r#"4"#),
+            (r#"4"#, r#"{"a": 1}"#, r#"{"a": 1}"#),
+        ];
+        for case in cases {
+            let (target, patch, expect) = case;
+            let target = target.parse::<Json>().unwrap();
+            let patch = patch.parse::<Json>().unwrap();
+            let expect = expect.parse::<Json>().unwrap();
+            let res = Json::merge_patch(target.as_ref(), patch.as_ref()).unwrap();
+            assert_eq!(res, expect);
+        }
+    }
+
+    /// Tests that a JSON object key which is not valid UTF-8 (e.g. the latin1
+    /// byte 0xFF produced by TiDB via `JSON_OBJECT(_latin1 X'FF', 1)`) can be
+    /// merged instead of failing with "encoding failed".
+    /// See <https://github.com/tikv/tikv/issues/20313>
+    #[test]
+    fn test_merge_patch_with_invalid_utf8_key() {
+        let target = r#"{}"#.parse::<Json>().unwrap();
+        // `JSON_OBJECT(_latin1 X'FF', 1)` in TiDB keeps the raw latin1 byte
+        // 0xFF as the object key, which is not valid UTF-8.
+        let patch =
+            Json::from_kv_pairs(vec![(b"\xFF", Json::from_i64(1).unwrap().as_ref())]).unwrap();
+
+        let res = Json::merge_patch(target.as_ref(), patch.as_ref()).unwrap();
+        // The key should be kept unchanged, like TiDB does with `string(key)`.
+        let expected =
+            Json::from_kv_pairs(vec![(b"\xFF", Json::from_i64(1).unwrap().as_ref())]).unwrap();
+        assert_eq!(res, expected);
+
+        // Merging the other way around: the non-UTF-8 key is in the target.
+        let res = Json::merge_patch(patch.as_ref(), target.as_ref()).unwrap();
+        assert_eq!(res, expected);
+
+        // Removing the non-UTF-8 key via a null patch value.
+        let null_patch =
+            Json::from_kv_pairs(vec![(b"\xFF", Json::none().unwrap().as_ref())]).unwrap();
+        let res = Json::merge_patch(expected.as_ref(), null_patch.as_ref()).unwrap();
+        let empty = Json::from_kv_pairs(vec![]).unwrap();
+        assert_eq!(res, empty);
+
+        // JSON_MERGE (`merge_binary_object`) has the same issue.
+        let jsons = [target, patch];
+        let refs = jsons.iter().map(|j| j.as_ref()).collect::<Vec<_>>();
+        let res = Json::merge(refs).unwrap();
+        assert_eq!(res, expected);
+    }
 
     #[test]
     fn test_merge() {
