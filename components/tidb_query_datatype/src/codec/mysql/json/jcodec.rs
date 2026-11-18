@@ -50,10 +50,13 @@ pub trait JsonEncoder: NumberEncoder {
 
         // Write key entries
         for (key, _) in entries.iter() {
-            let key_len = key.len();
+            // key-entry ::= key-offset(uint32) key-length(uint16), so the key
+            // length must fit in a u16 rather than silently wrapping around.
+            let key_len =
+                u16::try_from(key.len()).map_err(|_| Error::json_object_key_too_long())?;
             self.write_u32_le(key_offset as u32)?;
-            self.write_u16_le(key_len as u16)?;
-            key_offset += key_len;
+            self.write_u16_le(key_len)?;
+            key_offset += usize::from(key_len);
         }
 
         let mut value_offset = key_offset as u32;
@@ -95,10 +98,13 @@ pub trait JsonEncoder: NumberEncoder {
 
         // Write key entries
         for key in data.keys() {
-            let key_len = key.len();
+            // key-entry ::= key-offset(uint32) key-length(uint16), so the key
+            // length must fit in a u16 rather than silently wrapping around.
+            let key_len =
+                u16::try_from(key.len()).map_err(|_| Error::json_object_key_too_long())?;
             self.write_u32_le(key_offset as u32)?;
-            self.write_u16_le(key_len as u16)?;
-            key_offset += key_len;
+            self.write_u16_le(key_len)?;
+            key_offset += usize::from(key_len);
         }
 
         let mut value_offset = key_offset as u32;
@@ -274,6 +280,7 @@ impl<T: BufferReader> JsonDecoder for T {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::{convert::ToStringValue, error::ERR_JSON_OBJECT_KEY_TOO_LONG};
 
     #[test]
     fn test_json_binary() {
@@ -307,5 +314,46 @@ mod tests {
             let output_str = output.to_string();
             assert_eq!(input_str, output_str);
         }
+    }
+
+    #[test]
+    fn test_json_obj_key_length_overflow() {
+        // A key of `u16::MAX` bytes is the longest one representable by the
+        // `key-length(uint16)` field, and it must still be encoded correctly.
+        let max_key = "a".repeat(u16::MAX as usize);
+        let json = Json::from_object(BTreeMap::from([(
+            max_key.clone(),
+            Json::from_i64(1).unwrap(),
+        )]))
+        .unwrap();
+        assert_eq!(json.as_ref().object_get_key(0), max_key.as_bytes());
+        assert_eq!(json.to_string_value(), format!(r#"{{"{}": 1}}"#, max_key));
+
+        // One more byte does not fit, and must be rejected instead of wrapping
+        // the length around to another valid u16 value.
+        let too_long_key = "a".repeat(u16::MAX as usize + 1);
+        let err = Json::from_object(BTreeMap::from([(
+            too_long_key.clone(),
+            Json::from_i64(1).unwrap(),
+        )]))
+        .unwrap_err();
+        assert_eq!(err.code(), ERR_JSON_OBJECT_KEY_TOO_LONG);
+
+        // `write_json_obj_from_keys_values` shares the same limit.
+        let err = Json::from_kv_pairs(vec![(
+            too_long_key.as_bytes(),
+            Json::from_i64(1).unwrap().as_ref(),
+        )])
+        .unwrap_err();
+        assert_eq!(err.code(), ERR_JSON_OBJECT_KEY_TOO_LONG);
+
+        // Keys are checked by length in bytes, not in characters.
+        let multibyte_key = "世".repeat(u16::MAX as usize / 3 + 1);
+        let err = Json::from_object(BTreeMap::from([(
+            multibyte_key,
+            Json::from_i64(1).unwrap(),
+        )]))
+        .unwrap_err();
+        assert_eq!(err.code(), ERR_JSON_OBJECT_KEY_TOO_LONG);
     }
 }

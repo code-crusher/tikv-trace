@@ -25,6 +25,7 @@ pub const ERR_DATETIME_FUNCTION_OVERFLOW: i32 = 1441;
 pub const ERR_INCORRECT_PARAMETERS: i32 = 1583;
 pub const ERR_DATA_OUT_OF_RANGE: i32 = 1690;
 pub const ERR_CANNOT_CONVERT_STRING: i32 = 3854;
+pub const ERR_JSON_OBJECT_KEY_TOO_LONG: i32 = 8129;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -154,6 +155,15 @@ impl Error {
 
     pub fn regexp_error(msg: String) -> Error {
         Error::Eval(msg, ERR_REGEXP)
+    }
+
+    /// The error for a JSON object key that cannot be encoded into the 16-bit
+    /// key-length field of the binary JSON format.
+    pub fn json_object_key_too_long() -> Error {
+        Error::Eval(
+            "TiDB does not yet support JSON objects with the key length >= 65536".into(),
+            ERR_JSON_OBJECT_KEY_TOO_LONG,
+        )
     }
 }
 

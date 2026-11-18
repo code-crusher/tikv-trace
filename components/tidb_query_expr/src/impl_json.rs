@@ -529,6 +529,14 @@ mod tests {
     use super::*;
     use crate::types::test_util::RpnFnScalarEvaluator;
 
+    fn eval_err_code(err: tidb_query_common::Error) -> i32 {
+        use tidb_query_common::error::ErrorInner;
+        match *err.0 {
+            ErrorInner::Evaluate(e) => e.code(),
+            ErrorInner::Storage(e) => panic!("unexpected storage error: {}", e),
+        }
+    }
+
     #[test]
     fn test_json_depth() {
         let cases = vec![
@@ -781,6 +789,69 @@ mod tests {
 
             output.unwrap_err();
         }
+    }
+
+    #[test]
+    fn test_json_object_key_too_long() {
+        let max_key = "a".repeat(u16::MAX as usize);
+        let too_long_key = "a".repeat(u16::MAX as usize + 1);
+
+        // A key of `u16::MAX` bytes is still accepted.
+        let output: Option<Json> = RpnFnScalarEvaluator::new()
+            .push_params(vec![
+                ScalarValue::from(Bytes::from(max_key)),
+                ScalarValue::from(Json::from_i64(1).unwrap()),
+            ])
+            .evaluate(ScalarFuncSig::JsonObjectSig)
+            .unwrap();
+        assert!(output.is_some());
+
+        // A longer key must be rejected with the same error code as TiDB,
+        // instead of having its length silently truncated to a u16.
+        let err = RpnFnScalarEvaluator::new()
+            .push_params(vec![
+                ScalarValue::from(Bytes::from(too_long_key)),
+                ScalarValue::from(Json::from_i64(1).unwrap()),
+            ])
+            .evaluate::<Json>(ScalarFuncSig::JsonObjectSig)
+            .unwrap_err();
+        assert_eq!(
+            eval_err_code(err),
+            tidb_query_datatype::codec::error::ERR_JSON_OBJECT_KEY_TOO_LONG
+        );
+    }
+
+    #[test]
+    fn test_json_insert_key_too_long() {
+        let doc = Json::from_str("{}").unwrap();
+
+        // Inserting a `u16::MAX`-byte key is still accepted.
+        let max_path = format!(r#"$."{}""#, "a".repeat(u16::MAX as usize));
+        let output: Option<Json> = RpnFnScalarEvaluator::new()
+            .push_params(vec![
+                ScalarValue::from(doc.clone()),
+                ScalarValue::from(Bytes::from(max_path)),
+                ScalarValue::from(Json::from_i64(1).unwrap()),
+            ])
+            .evaluate(ScalarFuncSig::JsonInsertSig)
+            .unwrap();
+        assert!(output.is_some());
+
+        // Inserting a longer key must be rejected with the same error code as
+        // TiDB, instead of having its length silently truncated to a u16.
+        let too_long_path = format!(r#"$."{}""#, "a".repeat(u16::MAX as usize + 1));
+        let err = RpnFnScalarEvaluator::new()
+            .push_params(vec![
+                ScalarValue::from(doc),
+                ScalarValue::from(Bytes::from(too_long_path)),
+                ScalarValue::from(Json::from_i64(1).unwrap()),
+            ])
+            .evaluate::<Json>(ScalarFuncSig::JsonInsertSig)
+            .unwrap_err();
+        assert_eq!(
+            eval_err_code(err),
+            tidb_query_datatype::codec::error::ERR_JSON_OBJECT_KEY_TOO_LONG
+        );
     }
 
     #[test]
