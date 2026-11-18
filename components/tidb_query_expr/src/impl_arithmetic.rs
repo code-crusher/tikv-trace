@@ -1040,7 +1040,7 @@ mod tests {
             .build();
         let output: Option<Int> = RpnFnScalarEvaluator::new()
             .push_param_with_field_type(Decimal::from(1), lft)
-            .push_param_with_field_type(Decimal::from_f64(-2_f64).unwrap(), rft)
+            .push_param_with_field_type(Decimal::from_f64(-2_f64).unwrap().unwrap(), rft)
             .evaluate(ScalarFuncSig::IntDivideDecimal)
             .unwrap();
         assert_eq!(output, Some(0));
@@ -1055,7 +1055,7 @@ mod tests {
             .build();
         let output: Result<Option<Int>> = RpnFnScalarEvaluator::new()
             .push_param_with_field_type(Decimal::from(1), lft)
-            .push_param_with_field_type(Decimal::from_f64(-1_f64).unwrap(), rft)
+            .push_param_with_field_type(Decimal::from_f64(-1_f64).unwrap().unwrap(), rft)
             .evaluate(ScalarFuncSig::IntDivideDecimal);
         assert!(output.is_err(), "should be error");
     }

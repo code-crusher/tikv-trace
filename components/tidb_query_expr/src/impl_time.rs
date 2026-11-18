@@ -4194,7 +4194,7 @@ mod tests {
         ];
         let mut ctx = EvalContext::default();
         for (datetime, fsp, expected) in cases {
-            let decimal = Decimal::from_f64(datetime).unwrap();
+            let decimal = Decimal::from_f64(datetime).unwrap().unwrap();
             let mut result_field_type: FieldType = FieldTypeTp::DateTime.into();
             result_field_type.set_decimal(fsp as i32);
 
@@ -4238,7 +4238,7 @@ mod tests {
             ),
         ];
         for (datetime, format, fsp, expected) in cases {
-            let decimal = Decimal::from_f64(datetime).unwrap();
+            let decimal = Decimal::from_f64(datetime).unwrap().unwrap();
             let mut result_field_type: FieldType = FieldTypeTp::String.into();
             result_field_type.set_decimal(fsp);
             let (result, _) = RpnFnScalarEvaluator::new()

@@ -829,7 +829,7 @@ fn cast_real_as_decimal(
             let res = if metadata.get_in_union() && val < 0f64 {
                 Decimal::zero()
             } else {
-                Decimal::from_f64(val)?
+                val.convert(ctx)?
             };
             Ok(Some(produce_dec_with_specified_tp(
                 ctx,
@@ -1844,6 +1844,17 @@ mod tests {
     fn check_truncate(ctx: &EvalContext, truncate: bool, log: &str) {
         if truncate {
             check_warning(ctx, Some(ERR_TRUNCATE_WRONG_VALUE), log)
+        }
+    }
+
+    fn check_overflow_warnings(ctx: &EvalContext, cnt: usize) {
+        assert_eq!(
+            ctx.warnings.warning_cnt, cnt,
+            "warnings: {:?}",
+            ctx.warnings.warnings
+        );
+        for w in &ctx.warnings.warnings {
+            assert_eq!(w.get_code(), ERR_DATA_OUT_OF_RANGE);
         }
     }
 
@@ -3817,10 +3828,19 @@ mod tests {
         // so we needn't to check whether get truncated err.
         let cs = vec![
             // (input, expect)
-            (Decimal::from_f64(-10.0).unwrap(), -10.0),
-            (Decimal::from_f64(i64::MIN as f64).unwrap(), i64::MIN as f64),
-            (Decimal::from_f64(i64::MAX as f64).unwrap(), i64::MAX as f64),
-            (Decimal::from_f64(u64::MAX as f64).unwrap(), u64::MAX as f64),
+            (Decimal::from_f64(-10.0).unwrap().unwrap(), -10.0),
+            (
+                Decimal::from_f64(i64::MIN as f64).unwrap().unwrap(),
+                i64::MIN as f64,
+            ),
+            (
+                Decimal::from_f64(i64::MAX as f64).unwrap().unwrap(),
+                i64::MAX as f64,
+            ),
+            (
+                Decimal::from_f64(u64::MAX as f64).unwrap().unwrap(),
+                u64::MAX as f64,
+            ),
         ];
         for (input, expect) in cs {
             let mut ctx = EvalContext::default();
@@ -4551,22 +4571,22 @@ mod tests {
                 u64::MAX.to_string(),
             ),
             (
-                Decimal::from_f64(0.0).unwrap(),
+                Decimal::from_f64(0.0).unwrap().unwrap(),
                 0.0.to_string().into_bytes(),
                 0.0.to_string(),
             ),
             (
-                Decimal::from_f64(i64::MAX as f64).unwrap(),
+                Decimal::from_f64(i64::MAX as f64).unwrap().unwrap(),
                 (i64::MAX as f64).to_string().into_bytes(),
                 (i64::MAX as f64).to_string(),
             ),
             (
-                Decimal::from_f64(i64::MIN as f64).unwrap(),
+                Decimal::from_f64(i64::MIN as f64).unwrap().unwrap(),
                 (i64::MIN as f64).to_string().into_bytes(),
                 (i64::MIN as f64).to_string(),
             ),
             (
-                Decimal::from_f64(u64::MAX as f64).unwrap(),
+                Decimal::from_f64(u64::MAX as f64).unwrap().unwrap(),
                 (u64::MAX as f64).to_string().into_bytes(),
                 (u64::MAX as f64).to_string(),
             ),
@@ -5233,35 +5253,65 @@ mod tests {
             (-1.0, true, false, Decimal::zero()),
             (-0.0001, true, false, Decimal::zero()),
             // not neg and in_union
-            (10.0, true, false, Decimal::from_f64(10.0).unwrap()),
+            (10.0, true, false, Decimal::from_f64(10.0).unwrap().unwrap()),
             (
                 i64::MAX as f64,
                 true,
                 false,
-                Decimal::from_f64(i64::MAX as f64).unwrap(),
+                Decimal::from_f64(i64::MAX as f64).unwrap().unwrap(),
             ),
-            (1.0, true, false, Decimal::from_f64(1.0).unwrap()),
-            (0.0001, true, false, Decimal::from_f64(0.0001).unwrap()),
+            (1.0, true, false, Decimal::from_f64(1.0).unwrap().unwrap()),
+            (
+                0.0001,
+                true,
+                false,
+                Decimal::from_f64(0.0001).unwrap().unwrap(),
+            ),
             // neg and not in_union
-            (-10.0, false, false, Decimal::from_f64(-10.0).unwrap()),
+            (
+                -10.0,
+                false,
+                false,
+                Decimal::from_f64(-10.0).unwrap().unwrap(),
+            ),
             (
                 i64::MIN as f64,
                 false,
                 false,
-                Decimal::from_f64(i64::MIN as f64).unwrap(),
+                Decimal::from_f64(i64::MIN as f64).unwrap().unwrap(),
             ),
-            (-1.0, false, false, Decimal::from_f64(-1.0).unwrap()),
-            (-0.0001, false, false, Decimal::from_f64(-0.0001).unwrap()),
+            (
+                -1.0,
+                false,
+                false,
+                Decimal::from_f64(-1.0).unwrap().unwrap(),
+            ),
+            (
+                -0.0001,
+                false,
+                false,
+                Decimal::from_f64(-0.0001).unwrap().unwrap(),
+            ),
             // not neg and not in_union
-            (10.0, false, false, Decimal::from_f64(10.0).unwrap()),
+            (
+                10.0,
+                false,
+                false,
+                Decimal::from_f64(10.0).unwrap().unwrap(),
+            ),
             (
                 i64::MAX as f64,
                 false,
                 false,
-                Decimal::from_f64(i64::MAX as f64).unwrap(),
+                Decimal::from_f64(i64::MAX as f64).unwrap().unwrap(),
             ),
-            (1.0, false, false, Decimal::from_f64(1.0).unwrap()),
-            (0.0001, false, false, Decimal::from_f64(0.0001).unwrap()),
+            (1.0, false, false, Decimal::from_f64(1.0).unwrap().unwrap()),
+            (
+                0.0001,
+                false,
+                false,
+                Decimal::from_f64(0.0001).unwrap().unwrap(),
+            ),
         ];
         test_as_decimal_helper(
             cs,
@@ -5345,7 +5395,12 @@ mod tests {
             // not neg and in_union
             ("10", true, false, Decimal::from(10)),
             ("1", true, false, Decimal::from(1)),
-            ("0.001", true, false, Decimal::from_f64(0.001).unwrap()),
+            (
+                "0.001",
+                true,
+                false,
+                Decimal::from_f64(0.001).unwrap().unwrap(),
+            ),
             (
                 "9223372036854775807",
                 true,
@@ -5399,7 +5454,12 @@ mod tests {
             // neg and not in_union
             ("-10", false, false, Decimal::from(-10)),
             ("-1", false, false, Decimal::from(-1)),
-            ("-0.001", false, false, Decimal::from_f64(-0.001).unwrap()),
+            (
+                "-0.001",
+                false,
+                false,
+                Decimal::from_f64(-0.001).unwrap().unwrap(),
+            ),
             (
                 "-9223372036854775807",
                 false,
@@ -5455,7 +5515,12 @@ mod tests {
             // not neg and not in_union
             ("10", false, false, Decimal::from(10)),
             ("1", false, false, Decimal::from(1)),
-            ("0.001", false, false, Decimal::from_f64(0.001).unwrap()),
+            (
+                "0.001",
+                false,
+                false,
+                Decimal::from_f64(0.001).unwrap().unwrap(),
+            ),
             (
                 "9223372036854775807",
                 false,
@@ -5552,7 +5617,12 @@ mod tests {
             // not neg and in_union
             ("10", true, true, Decimal::from(10)),
             ("1", true, true, Decimal::from(1)),
-            ("0.001", true, true, Decimal::from_f64(0.001).unwrap()),
+            (
+                "0.001",
+                true,
+                true,
+                Decimal::from_f64(0.001).unwrap().unwrap(),
+            ),
             (
                 "9223372036854775807",
                 true,
@@ -5606,7 +5676,12 @@ mod tests {
             // neg and not in_union
             ("-10", false, true, Decimal::from(-10)),
             ("-1", false, true, Decimal::from(-1)),
-            ("-0.001", false, true, Decimal::from_f64(-0.001).unwrap()),
+            (
+                "-0.001",
+                false,
+                true,
+                Decimal::from_f64(-0.001).unwrap().unwrap(),
+            ),
             (
                 "-9223372036854775807",
                 false,
@@ -5662,7 +5737,12 @@ mod tests {
             // not neg and not in_union
             ("10", false, true, Decimal::from(10)),
             ("1", false, true, Decimal::from(1)),
-            ("0.001", false, true, Decimal::from_f64(0.001).unwrap()),
+            (
+                "0.001",
+                false,
+                true,
+                Decimal::from_f64(0.001).unwrap().unwrap(),
+            ),
             (
                 "9223372036854775807",
                 false,
@@ -5750,10 +5830,10 @@ mod tests {
             // in_union
             (Decimal::zero(), true, false, Decimal::zero()),
             (
-                Decimal::from_f64(-10f64).unwrap(),
+                Decimal::from_f64(-10f64).unwrap().unwrap(),
                 true,
                 false,
-                Decimal::from_f64(-10f64).unwrap(),
+                Decimal::from_f64(-10f64).unwrap().unwrap(),
             ),
             (
                 Decimal::from(i64::MIN),
@@ -5776,10 +5856,10 @@ mod tests {
             // not in_union
             (Decimal::zero(), false, false, Decimal::zero()),
             (
-                Decimal::from_f64(-10f64).unwrap(),
+                Decimal::from_f64(-10f64).unwrap().unwrap(),
                 false,
                 false,
-                Decimal::from_f64(-10f64).unwrap(),
+                Decimal::from_f64(-10f64).unwrap().unwrap(),
             ),
             (
                 Decimal::from(i64::MIN),
@@ -5819,7 +5899,7 @@ mod tests {
 
             // neg and in_union
             (
-                Decimal::from_f64(-10f64).unwrap(),
+                Decimal::from_f64(-10f64).unwrap().unwrap(),
                 true,
                 true,
                 Decimal::zero(),
@@ -5828,19 +5908,19 @@ mod tests {
             // not neg and in_union
             (Decimal::zero(), true, true, Decimal::zero()),
             (
-                Decimal::from_f64(10f64).unwrap(),
+                Decimal::from_f64(10f64).unwrap().unwrap(),
                 true,
                 true,
-                Decimal::from_f64(10f64).unwrap(),
+                Decimal::from_f64(10f64).unwrap().unwrap(),
             ),
             (Decimal::from(i64::MAX), true, true, Decimal::from(i64::MAX)),
             (Decimal::from(u64::MAX), true, true, Decimal::from(u64::MAX)),
             // neg and not in_union
             (
-                Decimal::from_f64(-10f64).unwrap(),
+                Decimal::from_f64(-10f64).unwrap().unwrap(),
                 false,
                 true,
-                Decimal::from_f64(-10f64).unwrap(),
+                Decimal::from_f64(-10f64).unwrap().unwrap(),
             ),
             (
                 Decimal::from(i64::MIN),
@@ -5851,10 +5931,10 @@ mod tests {
             // not neg and not in_union
             (Decimal::zero(), true, true, Decimal::zero()),
             (
-                Decimal::from_f64(10f64).unwrap(),
+                Decimal::from_f64(10f64).unwrap().unwrap(),
                 true,
                 true,
-                Decimal::from_f64(10f64).unwrap(),
+                Decimal::from_f64(10f64).unwrap().unwrap(),
             ),
             (Decimal::from(i64::MAX), true, true, Decimal::from(i64::MAX)),
             (Decimal::from(u64::MAX), true, true, Decimal::from(u64::MAX)),
@@ -5908,13 +5988,13 @@ mod tests {
                 Duration::parse(&mut ctx, "17:51:04.78", 2).unwrap(),
                 false,
                 false,
-                Decimal::from_f64(175104.78).unwrap(),
+                Decimal::from_f64(175104.78).unwrap().unwrap(),
             ),
             (
                 Duration::parse(&mut ctx, "-17:51:04.78", 2).unwrap(),
                 false,
                 false,
-                Decimal::from_f64(-175104.78).unwrap(),
+                Decimal::from_f64(-175104.78).unwrap().unwrap(),
             ),
             (
                 Duration::parse(&mut ctx, "17:51:04.78", 0).unwrap(),
@@ -5947,50 +6027,50 @@ mod tests {
                 Json::from_i64(10).unwrap(),
                 false,
                 false,
-                Decimal::from_f64(10f64).unwrap(),
+                Decimal::from_f64(10f64).unwrap().unwrap(),
             ),
             (
                 Json::from_i64(i64::MAX).unwrap(),
                 false,
                 false,
-                Decimal::from_f64(i64::MAX as f64).unwrap(),
+                Decimal::from_f64(i64::MAX as f64).unwrap().unwrap(),
             ),
             (
                 Json::from_i64(i64::MIN).unwrap(),
                 false,
                 false,
-                Decimal::from_f64(i64::MIN as f64).unwrap(),
+                Decimal::from_f64(i64::MIN as f64).unwrap().unwrap(),
             ),
             (Json::from_u64(0).unwrap(), false, false, Decimal::zero()),
             (
                 Json::from_u64(i64::MAX as u64).unwrap(),
                 false,
                 false,
-                Decimal::from_f64(i64::MAX as f64).unwrap(),
+                Decimal::from_f64(i64::MAX as f64).unwrap().unwrap(),
             ),
             (
                 Json::from_u64(u64::MAX).unwrap(),
                 false,
                 false,
-                Decimal::from_f64(u64::MAX as f64).unwrap(),
+                Decimal::from_f64(u64::MAX as f64).unwrap().unwrap(),
             ),
             (
                 Json::from_f64(i64::MAX as f64).unwrap(),
                 false,
                 false,
-                Decimal::from_f64(i64::MAX as f64).unwrap(),
+                Decimal::from_f64(i64::MAX as f64).unwrap().unwrap(),
             ),
             (
                 Json::from_f64(i64::MIN as f64).unwrap(),
                 false,
                 false,
-                Decimal::from_f64(i64::MIN as f64).unwrap(),
+                Decimal::from_f64(i64::MIN as f64).unwrap().unwrap(),
             ),
             (
                 Json::from_f64(u64::MAX as f64).unwrap(),
                 false,
                 false,
-                Decimal::from_f64(u64::MAX as f64).unwrap(),
+                Decimal::from_f64(u64::MAX as f64).unwrap().unwrap(),
             ),
             (
                 Json::from_string("10.0".to_string()).unwrap(),
@@ -6024,7 +6104,7 @@ mod tests {
                 Json::from_bool(true).unwrap(),
                 false,
                 false,
-                Decimal::from_f64(1f64).unwrap(),
+                Decimal::from_f64(1f64).unwrap().unwrap(),
             ),
             (
                 Json::from_bool(false).unwrap(),
@@ -6076,6 +6156,101 @@ mod tests {
             check_result(Some(&result), &r, log.as_str());
             check_warning(&ctx, Some(errcode), log.as_str());
         }
+    }
+
+    #[test]
+    fn test_real_as_decimal_overflow() {
+        // Cast a too large real as decimal(65, 0): the overflow should be
+        // handled by the EvalContext rather than fail the statement, and the
+        // result should be clamped to the maximum decimal, like TiDB
+        // (close #20311).
+        let rft = FieldTypeConfig {
+            flen: 65,
+            decimal: 0,
+            ..FieldTypeConfig::default()
+        }
+        .into();
+        let extra = make_extra(&rft);
+        let metadata = make_metadata(false);
+
+        // overflow_as_warning: the row is returned with a warning.
+        let mut ctx: EvalContext = CtxConfig {
+            overflow_as_warning: true,
+            ..CtxConfig::default()
+        }
+        .into();
+        let r = cast_real_as_decimal(&mut ctx, &extra, &metadata, Real::new(1e100).as_ref().ok());
+        let expect = max_decimal(65, 0);
+        let log = make_log(&1e100f64, &expect, &r);
+        check_result(Some(&expect), &r, log.as_str());
+        // Both the f64-to-decimal conversion and the adjustment to the
+        // target field type overflow, like TiDB's
+        // builtinCastRealAsDecimalSig.
+        check_overflow_warnings(&ctx, 2);
+
+        let mut ctx: EvalContext = CtxConfig {
+            overflow_as_warning: true,
+            ..CtxConfig::default()
+        }
+        .into();
+        let r = cast_real_as_decimal(&mut ctx, &extra, &metadata, Real::new(-1e100).as_ref().ok());
+        let expect = max_or_min_dec(true, 65, 0);
+        let log = make_log(&-1e100f64, &expect, &r);
+        check_result(Some(&expect), &r, log.as_str());
+        check_overflow_warnings(&ctx, 2);
+
+        // overflow is an error without the flag.
+        let mut ctx: EvalContext = CtxConfig::default().into();
+        let r = cast_real_as_decimal(&mut ctx, &extra, &metadata, Real::new(1e100).as_ref().ok());
+        assert!(r.is_err(), "expect error, but got {:?}", r);
+    }
+
+    #[test]
+    fn test_json_as_decimal_overflow() {
+        // Cast a too large json number as decimal(65, 0): the overflow should
+        // be handled by the EvalContext rather than fail the statement, and
+        // the result should be clamped to the maximum decimal, like TiDB
+        // (close #20311).
+        let rft = FieldTypeConfig {
+            flen: 65,
+            decimal: 0,
+            ..FieldTypeConfig::default()
+        }
+        .into();
+        let extra = make_extra(&rft);
+
+        // overflow_as_warning: the row is returned with a warning.
+        let mut ctx: EvalContext = CtxConfig {
+            overflow_as_warning: true,
+            ..CtxConfig::default()
+        }
+        .into();
+        let input = Json::from_f64(1e100).unwrap();
+        let r = cast_json_as_decimal(&mut ctx, &extra, Some(input.as_ref()));
+        let expect = max_decimal(65, 0);
+        let log = make_log(&input, &expect, &r);
+        check_result(Some(&expect), &r, log.as_str());
+        // Both the f64-to-decimal conversion and the adjustment to the
+        // target field type overflow, like TiDB's ConvertJSONToDecimal.
+        check_overflow_warnings(&ctx, 2);
+
+        let mut ctx: EvalContext = CtxConfig {
+            overflow_as_warning: true,
+            ..CtxConfig::default()
+        }
+        .into();
+        let input = Json::from_f64(-1e100).unwrap();
+        let r = cast_json_as_decimal(&mut ctx, &extra, Some(input.as_ref()));
+        let expect = max_or_min_dec(true, 65, 0);
+        let log = make_log(&input, &expect, &r);
+        check_result(Some(&expect), &r, log.as_str());
+        check_overflow_warnings(&ctx, 2);
+
+        // overflow is an error without the flag.
+        let mut ctx: EvalContext = CtxConfig::default().into();
+        let input = Json::from_f64(1e100).unwrap();
+        let r = cast_json_as_decimal(&mut ctx, &extra, Some(input.as_ref()));
+        assert!(r.is_err(), "expect error, but got {:?}", r);
     }
 
     #[test]
@@ -7076,11 +7251,11 @@ mod tests {
         test_none_with_ctx(cast_any_as_json::<Decimal>);
         let cs = vec![
             (
-                Decimal::from_f64(i64::MIN as f64).unwrap(),
+                Decimal::from_f64(i64::MIN as f64).unwrap().unwrap(),
                 Json::from_f64(i64::MIN as f64).unwrap(),
             ),
             (
-                Decimal::from_f64(i64::MAX as f64).unwrap(),
+                Decimal::from_f64(i64::MAX as f64).unwrap().unwrap(),
                 Json::from_f64(i64::MAX as f64).unwrap(),
             ),
             (

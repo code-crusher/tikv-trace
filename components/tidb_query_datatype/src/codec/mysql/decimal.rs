@@ -1577,12 +1577,20 @@ impl Decimal {
         Res::Ok(x)
     }
 
-    pub fn from_f64(val: f64) -> Result<Decimal> {
+    /// Returns a `Decimal` from a given float number.
+    ///
+    /// The float is formatted in scientific notation so that huge or tiny
+    /// magnitudes are clamped to the maximum/zero decimal by the exponent
+    /// handling in `from_bytes_with_word_buf`, exactly like TiDB's
+    /// `MyDecimal::from_float64`, which parses `strconv.FormatFloat(f, 'g',
+    /// -1, 64)`. Overflow and truncation are reported via `Res` so that
+    /// callers can apply the overflow policy of the `EvalContext` (see
+    /// `Res::into_result_with_overflow_err`).
+    pub fn from_f64(val: f64) -> Result<Res<Decimal>> {
         if val.is_infinite() {
             Err(invalid_type!("{} can't be convert to decimal'", val))
         } else {
-            let r = val.to_string();
-            Decimal::from_str(r.as_str())
+            Decimal::from_bytes(format!("{:e}", val).as_bytes())
         }
     }
 
@@ -1833,9 +1841,16 @@ impl ConvertTo<Decimal> for f64 {
     ///
     /// This function will use float's canonical string representation
     /// rather than the accurate value the float represent.
+    ///
+    /// Overflow and truncation are handled by the `EvalContext`, so a
+    /// too large float is clamped to the maximum decimal with a warning
+    /// (or an error, depending on the SQL mode), like TiDB's
+    /// `builtinCastRealAsDecimalSig::evalDecimal`.
     #[inline]
-    fn convert(&self, _: &mut EvalContext) -> Result<Decimal> {
-        Decimal::from_f64(*self)
+    fn convert(&self, ctx: &mut EvalContext) -> Result<Decimal> {
+        let r = Decimal::from_f64(*self)?;
+        let err = Error::overflow("DECIMAL", "");
+        r.into_result_with_overflow_err(ctx, err)
     }
 }
 
@@ -1896,7 +1911,7 @@ impl ConvertTo<Decimal> for JsonRef<'_> {
             }
             _ => {
                 let r: f64 = self.convert(ctx)?;
-                Decimal::from_f64(r)
+                r.convert(ctx)
             }
         }
     }
@@ -2520,7 +2535,7 @@ mod tests {
             ),
         ];
         for (input, expect) in cs {
-            let r = Decimal::from_f64(input);
+            let r = Decimal::from_f64(input).map(|x| x.unwrap());
             let log = format!(
                 "input: {}, expect: {:?}, output: {:?}",
                 input,
@@ -2540,6 +2555,39 @@ mod tests {
                     assert_eq!(r.unwrap(), d, "{}", log.as_str());
                 }
             }
+        }
+
+        // The `Res` of a too large/small float is the clamped value, like TiDB's
+        // `MyDecimal::from_float64`.
+        let cs = vec![
+            (
+                1e100,
+                Res::Overflow(max_or_min_dec(false, WORD_BUF_LEN * DIGITS_PER_WORD, 0)),
+            ),
+            (
+                -1e100,
+                Res::Overflow(max_or_min_dec(true, WORD_BUF_LEN * DIGITS_PER_WORD, 0)),
+            ),
+            (
+                f64::MAX,
+                Res::Overflow(max_or_min_dec(false, WORD_BUF_LEN * DIGITS_PER_WORD, 0)),
+            ),
+            (
+                f64::MIN,
+                Res::Overflow(max_or_min_dec(true, WORD_BUF_LEN * DIGITS_PER_WORD, 0)),
+            ),
+            (f64::MIN_POSITIVE, Res::Truncated(Decimal::zero())),
+        ];
+        for (input, expect) in cs {
+            let r = Decimal::from_f64(input).unwrap();
+            let log = format!("input: {}, expect: {:?}, output: {:?}", input, expect, r);
+            assert_eq!(
+                std::mem::discriminant(&r),
+                std::mem::discriminant(&expect),
+                "{}",
+                log
+            );
+            assert_eq!(r.unwrap(), expect.unwrap(), "{}", log);
         }
     }
 
@@ -3184,7 +3232,7 @@ mod tests {
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
         let decoded = src.as_slice().read_decimal_from_chunk().unwrap();
-        assert_eq!(Decimal::from_f64(123.456).unwrap(), decoded);
+        assert_eq!(Decimal::from_f64(123.456).unwrap().unwrap(), decoded);
     }
 
     #[test]
@@ -3828,6 +3876,35 @@ mod tests {
             );
             assert_eq!(truncate_as_warning_ctx.warnings.warning_cnt, 1);
         }
+    }
+
+    #[test]
+    fn test_f64_to_decimal_overflow() {
+        let max = max_decimal(WORD_BUF_LEN * DIGITS_PER_WORD, 0);
+        let min = max_or_min_dec(true, WORD_BUF_LEN * DIGITS_PER_WORD, 0);
+
+        // Overflow is an error unless the context downgrades it to a warning.
+        let mut ctx = EvalContext::default();
+        let val: Result<Decimal> = 1e100.convert(&mut ctx);
+        assert!(val.is_err(), "expected error, but got {:?}", val);
+        assert_eq!(val.unwrap_err().code(), ERR_DATA_OUT_OF_RANGE);
+
+        // OVERFLOW_AS_WARNING: the value is clamped to the maximum decimal,
+        // like TiDB's builtinCastRealAsDecimalSig (close #20311).
+        let mut ctx = EvalContext::new(Arc::new(EvalConfig::from_flag(Flag::OVERFLOW_AS_WARNING)));
+        let val: Decimal = 1e100.convert(&mut ctx).unwrap();
+        assert_eq!(val, max, "expect: {:?}, got: {:?}", val, max);
+        let val: Decimal = (-1e100f64).convert(&mut ctx).unwrap();
+        assert_eq!(val, min, "expect: {:?}, got: {:?}", val, min);
+        assert_eq!(ctx.warnings.warning_cnt, 2);
+        assert_eq!(ctx.warnings.warnings[0].get_code(), ERR_DATA_OUT_OF_RANGE);
+
+        // Underflow is truncated to zero, like TiDB's MyDecimal::from_float64.
+        let mut ctx = EvalContext::new(Arc::new(EvalConfig::from_flag(Flag::TRUNCATE_AS_WARNING)));
+        let val: Decimal = 1e-100.convert(&mut ctx).unwrap();
+        assert_eq!(val, Decimal::zero(), "expect: 0, got: {:?}", val);
+        assert_eq!(ctx.warnings.warning_cnt, 1);
+        assert_eq!(ctx.warnings.warnings[0].get_code(), WARN_DATA_TRUNCATED);
     }
 
     #[test]

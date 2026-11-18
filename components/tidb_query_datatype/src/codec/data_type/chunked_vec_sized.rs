@@ -142,11 +142,11 @@ mod tests {
     #[test]
     fn test_slice_vec() {
         let test_decimal: &[Option<Decimal>] = &[
-            Decimal::from_f64(1.233).ok(),
-            Decimal::from_f64(2.233).ok(),
-            Decimal::from_f64(3.233).ok(),
-            Decimal::from_f64(4.233).ok(),
-            Decimal::from_f64(5.233).ok(),
+            Decimal::from_f64(1.233).map(|r| r.unwrap()).ok(),
+            Decimal::from_f64(2.233).map(|r| r.unwrap()).ok(),
+            Decimal::from_f64(3.233).map(|r| r.unwrap()).ok(),
+            Decimal::from_f64(4.233).map(|r| r.unwrap()).ok(),
+            Decimal::from_f64(5.233).map(|r| r.unwrap()).ok(),
             None,
         ];
         assert_eq!(

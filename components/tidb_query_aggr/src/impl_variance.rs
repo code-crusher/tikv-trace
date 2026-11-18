@@ -486,8 +486,14 @@ mod tests {
         result[2].clear();
         state.push_result(&mut ctx, &mut result[..]).unwrap();
         assert_eq!(result[0].to_int_vec(), &[Some(2)]);
-        assert_eq!(result[1].to_decimal_vec(), &[Decimal::from_f64(3.0).ok()]);
-        assert_eq!(result[2].to_decimal_vec(), &[Decimal::from_f64(0.25).ok()]);
+        assert_eq!(
+            result[1].to_decimal_vec(),
+            &[Decimal::from_f64(3.0).map(|r| r.unwrap()).ok()]
+        );
+        assert_eq!(
+            result[2].to_decimal_vec(),
+            &[Decimal::from_f64(0.25).map(|r| r.unwrap()).ok()]
+        );
 
         update!(state, &mut ctx, Option::<EnumRef<'_>>::None).unwrap();
         result[0].clear();
@@ -495,8 +501,14 @@ mod tests {
         result[2].clear();
         state.push_result(&mut ctx, &mut result[..]).unwrap();
         assert_eq!(result[0].to_int_vec(), &[Some(2)]);
-        assert_eq!(result[1].to_decimal_vec(), &[Decimal::from_f64(3.0).ok()]);
-        assert_eq!(result[2].to_decimal_vec(), &[Decimal::from_f64(0.25).ok()]);
+        assert_eq!(
+            result[1].to_decimal_vec(),
+            &[Decimal::from_f64(3.0).map(|r| r.unwrap()).ok()]
+        );
+        assert_eq!(
+            result[2].to_decimal_vec(),
+            &[Decimal::from_f64(0.25).map(|r| r.unwrap()).ok()]
+        );
     }
 
     #[test]
@@ -528,8 +540,14 @@ mod tests {
         result[2].clear();
         state.push_result(&mut ctx, &mut result[..]).unwrap();
         assert_eq!(result[0].to_int_vec(), &[Some(2)]);
-        assert_eq!(result[1].to_decimal_vec(), &[Decimal::from_f64(3.0).ok()]);
-        assert_eq!(result[2].to_decimal_vec(), &[Decimal::from_f64(0.25).ok()]);
+        assert_eq!(
+            result[1].to_decimal_vec(),
+            &[Decimal::from_f64(3.0).map(|r| r.unwrap()).ok()]
+        );
+        assert_eq!(
+            result[2].to_decimal_vec(),
+            &[Decimal::from_f64(0.25).map(|r| r.unwrap()).ok()]
+        );
 
         update!(state, &mut ctx, Option::<SetRef<'_>>::None).unwrap();
         result[0].clear();
@@ -537,8 +555,14 @@ mod tests {
         result[2].clear();
         state.push_result(&mut ctx, &mut result[..]).unwrap();
         assert_eq!(result[0].to_int_vec(), &[Some(2)]);
-        assert_eq!(result[1].to_decimal_vec(), &[Decimal::from_f64(3.0).ok()]);
-        assert_eq!(result[2].to_decimal_vec(), &[Decimal::from_f64(0.25).ok()]);
+        assert_eq!(
+            result[1].to_decimal_vec(),
+            &[Decimal::from_f64(3.0).map(|r| r.unwrap()).ok()]
+        );
+        assert_eq!(
+            result[2].to_decimal_vec(),
+            &[Decimal::from_f64(0.25).map(|r| r.unwrap()).ok()]
+        );
     }
 
     #[test]
