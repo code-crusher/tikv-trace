@@ -18,6 +18,97 @@ fn invalid_pos_error(pos: i64, count: usize) -> Error {
     Error::regexp_error(format!("Invalid pos: {} in regexp, count: {}", pos, count))
 }
 
+/// A regexp haystack decoded the way TiDB does it.
+///
+/// TiDB hands the raw bytes to Go's `regexp` package, which decodes the input
+/// with `utf8.DecodeRune`: every byte of a malformed UTF-8 sequence is treated
+/// as one U+FFFD rune. Input in a non-UTF-8 charset (e.g. latin1, where 0xFF
+/// is a valid character) therefore must not fail the query; its bytes match as
+/// U+FFFD instead.
+///
+/// `decoded` holds the resulting UTF-8 text the regex runs over, and
+/// `boundaries` aligns its character boundaries with the raw bytes so that
+/// matches can be reported as the original bytes, like TiDB does.
+struct RegexpHaystack<'a> {
+    decoded: String,
+    raw: &'a [u8],
+    /// `(decoded offset, raw offset)` of every character in `decoded`, plus a
+    /// trailing entry for the end of the string. Empty when the input was
+    /// valid UTF-8, in which case both offsets coincide.
+    boundaries: Vec<(usize, usize)>,
+}
+
+impl<'a> RegexpHaystack<'a> {
+    fn decode(data: &'a [u8]) -> RegexpHaystack<'a> {
+        if let Ok(text) = std::str::from_utf8(data) {
+            return RegexpHaystack {
+                decoded: text.to_owned(),
+                raw: data,
+                boundaries: Vec::new(),
+            };
+        }
+
+        let mut decoded = String::with_capacity(data.len());
+        let mut boundaries = Vec::with_capacity(data.len() + 1);
+        let mut raw_offset = 0;
+        while raw_offset < data.len() {
+            // Mirror Go's utf8.DecodeRune: a byte that does not begin a valid
+            // UTF-8 sequence yields U+FFFD and consumes one byte.
+            let width = match data[raw_offset] {
+                0xC2..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF4 => 4,
+                _ => 1,
+            };
+            match data
+                .get(raw_offset..raw_offset + width)
+                .and_then(|seq| std::str::from_utf8(seq).ok())
+                .filter(|seq| seq.chars().count() == 1)
+            {
+                Some(seq) => {
+                    boundaries.push((decoded.len(), raw_offset));
+                    decoded.push_str(seq);
+                    raw_offset += width;
+                }
+                None => {
+                    boundaries.push((decoded.len(), raw_offset));
+                    decoded.push(char::REPLACEMENT_CHARACTER);
+                    raw_offset += 1;
+                }
+            }
+        }
+        boundaries.push((decoded.len(), raw_offset));
+
+        RegexpHaystack {
+            decoded,
+            raw: data,
+            boundaries,
+        }
+    }
+
+    /// Maps a character boundary of `decoded` to the offset in the raw bytes.
+    fn raw_offset(&self, decoded_offset: usize) -> usize {
+        // Valid UTF-8 input keeps a one-to-one offset correspondence.
+        if self.boundaries.is_empty() {
+            return decoded_offset;
+        }
+        match self
+            .boundaries
+            .binary_search_by_key(&decoded_offset, |(d, _)| *d)
+        {
+            Ok(idx) => self.boundaries[idx].1,
+            // Unreachable for offsets taken from matches on `decoded`.
+            Err(idx) => self.boundaries[idx.saturating_sub(1)].1,
+        }
+    }
+
+    /// Returns the raw bytes behind `decoded[from..to]`, which must both be
+    /// character boundaries of `decoded`.
+    fn raw_bytes(&self, from: usize, to: usize) -> &'a [u8] {
+        &self.raw[self.raw_offset(from)..self.raw_offset(to)]
+    }
+}
+
 fn is_valid_match_type(m: char) -> bool {
     matches!(m, 'i' | 'c' | 'm' | 's')
 }
@@ -114,7 +205,8 @@ fn init_regexp_data<C: Collator, const N: usize>(expr: &mut Expr) -> Result<Opti
     build_regexp::<C>(pattern, match_type).map(Some)
 }
 
-/// Currently, TiDB only supports regular expressions for utf-8 strings.
+/// TiDB evaluates regular expressions with Go's `regexp` package, which never
+/// fails on malformed UTF-8: each invalid byte is one U+FFFD rune.
 /// See https://dev.mysql.com/doc/refman/8.0/en/regexp.html#function_regexp-like.
 #[rpn_fn(nullable, raw_varg, min_args = 2, max_args = 3, capture = [metadata], metadata_mapper = init_regexp_data::<C, LIKE_MATCH_IDX>)]
 #[inline]
@@ -123,7 +215,7 @@ pub fn regexp_like<C: Collator>(
     args: &[ScalarValueRef<'_>],
 ) -> Result<Option<i64>> {
     let expr = match args[0].as_bytes() {
-        Some(e) => std::str::from_utf8(e)?,
+        Some(e) => RegexpHaystack::decode(e),
         None => return Ok(None),
     };
     let regex = match metadata {
@@ -134,10 +226,11 @@ pub fn regexp_like<C: Collator>(
         },
     };
 
-    Ok(Some(regex.is_match(expr) as i64))
+    Ok(Some(regex.is_match(&expr.decoded) as i64))
 }
 
-/// Currently, TiDB only supports regular expressions for utf-8 strings.
+/// TiDB evaluates regular expressions with Go's `regexp` package, which never
+/// fails on malformed UTF-8: each invalid byte is one U+FFFD rune.
 /// See https://dev.mysql.com/doc/refman/8.0/en/regexp.html#function_regexp-substr.
 #[rpn_fn(nullable, raw_varg, min_args = 2, max_args = 5, capture = [metadata], metadata_mapper = init_regexp_data::<C, SUBSTR_MATCH_IDX>)]
 #[inline]
@@ -145,8 +238,8 @@ pub fn regexp_substr<C: Collator>(
     metadata: &Option<Regex>,
     args: &[ScalarValueRef<'_>],
 ) -> Result<Option<Bytes>> {
-    let mut expr = match args[0].as_bytes() {
-        Some(e) => std::str::from_utf8(e)?,
+    let haystack = match args[0].as_bytes() {
+        Some(e) => RegexpHaystack::decode(e),
         None => return Ok(None),
     };
     let regex = match metadata {
@@ -157,6 +250,10 @@ pub fn regexp_substr<C: Collator>(
         },
     };
 
+    // TiDB trims the string before the given character position, so positions
+    // count the characters of the decoded text.
+    let mut expr: &str = &haystack.decoded;
+    let mut trim = 0;
     if args.len() >= 3 {
         let pos = match EvaluableRef::borrow_scalar_value_ref(args[2]) {
             Some::<&i64>(p) => *p,
@@ -165,6 +262,7 @@ pub fn regexp_substr<C: Collator>(
 
         if pos >= 1 {
             if let Some((idx, _)) = expr.char_indices().nth((pos - 1) as usize) {
+                trim = idx;
                 expr = &expr[idx..];
             } else if pos != 1 {
                 // Char count == 0 && pos == 1 is valid.
@@ -188,13 +286,19 @@ pub fn regexp_substr<C: Collator>(
     };
 
     if let Some(m) = regex.find_iter(expr).nth((occurrence - 1) as usize) {
-        return Ok(Some(m.as_str().as_bytes().to_vec()));
+        // Report the original bytes behind the match, like TiDB does.
+        return Ok(Some(
+            haystack
+                .raw_bytes(trim + m.start(), trim + m.end())
+                .to_vec(),
+        ));
     }
 
     Ok(None)
 }
 
-/// Currently, TiDB only supports regular expressions for utf-8 strings.
+/// TiDB evaluates regular expressions with Go's `regexp` package, which never
+/// fails on malformed UTF-8: each invalid byte is one U+FFFD rune.
 /// See https://dev.mysql.com/doc/refman/8.0/en/regexp.html#function_regexp-instr.
 #[rpn_fn(nullable, raw_varg, min_args = 2, max_args = 6, capture = [metadata], metadata_mapper = init_regexp_data::<C, INSTR_MATCH_IDX>)]
 #[inline]
@@ -202,10 +306,11 @@ pub fn regexp_instr<C: Collator>(
     metadata: &Option<Regex>,
     args: &[ScalarValueRef<'_>],
 ) -> Result<Option<i64>> {
-    let mut expr = match args[0].as_bytes() {
-        Some(e) => std::str::from_utf8(e)?,
+    let haystack = match args[0].as_bytes() {
+        Some(e) => RegexpHaystack::decode(e),
         None => return Ok(None),
     };
+    let mut expr: &str = &haystack.decoded;
     let regex = match metadata {
         Some(r) => Cow::Borrowed(r),
         None => match build_regexp_from_args::<C>(args, INSTR_MATCH_IDX)? {
@@ -337,7 +442,8 @@ fn init_replace_instructions(replace_expr: &[u8]) -> Vec<ReplaceInstruction> {
     instructions
 }
 
-/// Currently, TiDB only supports regular expressions for utf-8 strings.
+/// TiDB evaluates regular expressions with Go's `regexp` package, which never
+/// fails on malformed UTF-8: each invalid byte is one U+FFFD rune.
 /// See https://dev.mysql.com/doc/refman/8.0/en/regexp.html#function_regexp-replace.
 #[rpn_fn(nullable, raw_varg, min_args = 3, max_args = 6, capture = [metadata], metadata_mapper = init_regexp_replace_data::<C>)]
 #[inline]
@@ -345,10 +451,11 @@ pub fn regexp_replace<C: Collator>(
     metadata: &ReplaceMetaData,
     args: &[ScalarValueRef<'_>],
 ) -> Result<Option<Bytes>> {
-    let expr = match args[0].as_bytes() {
-        Some(e) => std::str::from_utf8(e)?,
+    let haystack = match args[0].as_bytes() {
+        Some(e) => RegexpHaystack::decode(e),
         None => return Ok(None),
     };
+    let expr: &str = &haystack.decoded;
     let regex = match metadata.regex.as_ref() {
         Some(r) => Cow::Borrowed(r),
         None => match build_regexp_from_args::<C>(args, REPLACE_MATCH_IDX)? {
@@ -364,7 +471,7 @@ pub fn regexp_replace<C: Collator>(
         },
     };
 
-    let (mut before_trimmed, mut trimmed) = ("", expr);
+    let (mut trim, mut trimmed) = (0, expr);
     if args.len() >= 4 {
         let pos = match EvaluableRef::borrow_scalar_value_ref(args[3]) {
             Some::<&i64>(p) => *p,
@@ -373,7 +480,7 @@ pub fn regexp_replace<C: Collator>(
 
         if pos >= 1 {
             if let Some((idx, _)) = expr.char_indices().nth((pos - 1) as usize) {
-                before_trimmed = &expr[..idx];
+                trim = idx;
                 trimmed = &expr[idx..];
             } else if pos != 1 {
                 // Char count == 0 && pos == 1 is valid.
@@ -406,7 +513,8 @@ pub fn regexp_replace<C: Collator>(
                             *num
                         ))
                     })?;
-                    res.extend(m.as_str().as_bytes());
+                    // Copy the original bytes behind the capture, like TiDB.
+                    res.extend(haystack.raw_bytes(trim + m.start(), trim + m.end()));
                 }
                 ReplaceInstruction::Literal(lit) => {
                     res.extend(lit);
@@ -417,24 +525,24 @@ pub fn regexp_replace<C: Collator>(
     };
 
     let mut result = Vec::new();
-    result.extend(before_trimmed.as_bytes());
+    result.extend(haystack.raw_bytes(0, trim));
     let mut last_match = 0;
     if occurrence == 0 {
         for capture in regex.captures_iter(trimmed) {
             // unwrap on 0 is OK because captures only reports matches.
             let m = capture.get(0).unwrap();
-            result.extend(&trimmed.as_bytes()[last_match..m.start()]);
+            result.extend(haystack.raw_bytes(trim + last_match, trim + m.start()));
             last_match = m.end();
             replace_work(&capture, &mut result)?;
         }
     } else if let Some(capture) = regex.captures_iter(trimmed).nth((occurrence - 1) as usize) {
         // unwrap on 0 is OK because captures only reports matches.
         let m = capture.get(0).unwrap();
-        result.extend(&trimmed.as_bytes()[0..m.start()]);
+        result.extend(haystack.raw_bytes(trim, trim + m.start()));
         last_match = m.end();
         replace_work(&capture, &mut result)?;
     }
-    result.extend(&trimmed.as_bytes()[last_match..]);
+    result.extend(haystack.raw_bytes(trim + last_match, expr.len()));
 
     Ok(Some(result))
 }
@@ -442,14 +550,58 @@ pub fn regexp_replace<C: Collator>(
 #[cfg(test)]
 mod tests {
     use tidb_query_datatype::{
-        EvalType, FieldTypeTp,
+        Collation, EvalType, FieldTypeAccessor, FieldTypeTp,
         codec::batch::{LazyBatchColumn, LazyBatchColumnVec},
         expr::EvalContext,
     };
     use tipb::ScalarFuncSig;
     use tipb_helper::ExprDefBuilder;
 
+    use super::RegexpHaystack;
     use crate::RpnExpressionBuilder;
+
+    #[test]
+    fn test_regexp_haystack_decode() {
+        // Valid UTF-8 keeps a one-to-one offset correspondence.
+        let h = RegexpHaystack::decode("a你b".as_bytes());
+        assert_eq!(h.decoded, "a你b");
+        assert!(h.boundaries.is_empty());
+        assert_eq!(h.raw_bytes(0, h.decoded.len()), "a你b".as_bytes());
+        assert_eq!(h.raw_bytes(1, "a你".len()), "你".as_bytes());
+
+        // Every malformed byte decodes to one U+FFFD, like Go's utf8.DecodeRune
+        // that TiDB's regexp relies on.
+        let cases: Vec<(&[u8], &str)> = vec![
+            (&[0xFF], "\u{FFFD}"),               // latin1 ÿ
+            (&[0xE9], "\u{FFFD}"),               // latin1 é
+            (&[0xC3, 0x28], "\u{FFFD}("),        // broken two-byte sequence
+            (&[0xE4, 0xB8], "\u{FFFD}\u{FFFD}"), // truncated three-byte sequence
+            (&[0xF0, 0x9F], "\u{FFFD}\u{FFFD}"), // truncated four-byte sequence
+            (
+                &[0xF5, 0x80, 0x80, 0x80],
+                "\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}",
+            ), // out of range
+            (&[0xED, 0xA0, 0x80], "\u{FFFD}\u{FFFD}\u{FFFD}"), // UTF-16 surrogate
+            (&[0xC0, 0xAF], "\u{FFFD}\u{FFFD}"), // overlong encoding
+            (&[0x61, 0xFF, 0x62], "a\u{FFFD}b"), // valid bytes around
+            (&[0xE4, 0xB8, 0x80, 0xFF], "一\u{FFFD}"), // valid character then invalid
+        ];
+        for (data, decoded) in cases {
+            let h = RegexpHaystack::decode(data);
+            assert_eq!(h.decoded, decoded, "unexpected decoding for {:X?}", data);
+            // The whole input maps back to itself.
+            assert_eq!(h.raw_bytes(0, h.decoded.len()), data);
+        }
+
+        // Offsets of a mixed haystack map back to the original bytes. The
+        // decoded text is "a\u{FFFD}一b", where \u{FFFD} occupies decoded
+        // offsets 1..4 and "一" offsets 4..7.
+        let h = RegexpHaystack::decode(&[b'a', 0xFF, 0xE4, 0xB8, 0x80, b'b']);
+        assert_eq!(h.decoded, "a\u{FFFD}一b");
+        assert_eq!(h.raw_bytes(1, 4), &[0xFF]);
+        assert_eq!(h.raw_bytes(4, 7), &[0xE4, 0xB8, 0x80]);
+        assert_eq!(h.raw_bytes(4, h.decoded.len()), &[0xE4, 0xB8, 0x80, b'b']);
+    }
 
     #[test]
     fn test_regexp_like() {
@@ -1635,5 +1787,130 @@ mod tests {
             assert_eq!(v.len(), 1);
             assert_eq!(v[0], None);
         }
+    }
+
+    /// Evaluates a regexp `sig` over latin1_bin input, where bytes such as 0xFF
+    /// or 0xE9 are valid characters. `check` inspects the single result value.
+    fn eval_regexp_on_bytes<R>(
+        sig: ScalarFuncSig,
+        ret_tp: FieldTypeTp,
+        expr: &[u8],
+        pattern: &[u8],
+        extra_int_args: &[i64],
+        extra_bytes_args: &[&[u8]],
+        check: impl FnOnce(&crate::types::RpnStackNodeVectorValue<'_>) -> R,
+    ) -> R {
+        let mut ctx = EvalContext::default();
+
+        let mut builder = ExprDefBuilder::scalar_func(sig, ret_tp);
+        builder = builder
+            .push_child(ExprDefBuilder::constant_bytes(expr.to_vec()))
+            .push_child(ExprDefBuilder::constant_bytes(pattern.to_vec()));
+        for arg in extra_int_args {
+            builder = builder.push_child(ExprDefBuilder::constant_int(*arg));
+        }
+        for arg in extra_bytes_args {
+            builder = builder.push_child(ExprDefBuilder::constant_bytes(arg.to_vec()));
+        }
+
+        let mut node = builder.build();
+        node.mut_field_type()
+            .as_mut_accessor()
+            .set_collation(Collation::Latin1Bin);
+
+        let exp = RpnExpressionBuilder::build_from_expr_tree(node, &mut ctx, 1).unwrap();
+        let schema = &[];
+        let mut columns = LazyBatchColumnVec::empty();
+        let val = exp.eval(&mut ctx, schema, &mut columns, &[], 1).unwrap();
+        assert!(val.is_vector());
+        check(val.vector_value().unwrap())
+    }
+
+    /// Regular expressions must not fail on non-UTF-8 bytes. TiDB evaluates
+    /// them with Go's `regexp`, which decodes every malformed byte as one
+    /// U+FFFD rune; a latin1 0xFF therefore matches `.` and the row is
+    /// returned instead of an Utf8Error. See issue #20307.
+    #[test]
+    fn test_regexp_on_invalid_utf8() {
+        // regexp_instr(expr, '.'): latin1 0xFF is one character, position 1.
+        eval_regexp_on_bytes(
+            ScalarFuncSig::RegexpInStrSig,
+            FieldTypeTp::LongLong,
+            &[0xFF],
+            b".",
+            &[],
+            &[],
+            |v| assert_eq!(v.as_ref().to_int_vec(), vec![Some(1)]),
+        );
+
+        // regexp_like(expr, '.'): the same match through the LIKE operator.
+        eval_regexp_on_bytes(
+            ScalarFuncSig::RegexpLikeSig,
+            FieldTypeTp::LongLong,
+            &[0xFF],
+            b".",
+            &[],
+            &[],
+            |v| assert_eq!(v.as_ref().to_int_vec(), vec![Some(1)]),
+        );
+
+        // regexp_substr reports the original bytes behind the match.
+        eval_regexp_on_bytes(
+            ScalarFuncSig::RegexpSubstrSig,
+            FieldTypeTp::String,
+            b"ab\xE9",
+            b"b.",
+            &[],
+            &[],
+            |v| assert_eq!(v.as_ref().to_bytes_vec(), vec![Some(b"b\xE9".to_vec())]),
+        );
+
+        // regexp_substr from a position after an invalid byte: positions
+        // count characters, and the result keeps the original byte.
+        eval_regexp_on_bytes(
+            ScalarFuncSig::RegexpSubstrSig,
+            FieldTypeTp::String,
+            &[b'a', 0xFF, b'b', 0xE9],
+            b".",
+            &[2],
+            &[],
+            |v| assert_eq!(v.as_ref().to_bytes_vec(), vec![Some(vec![0xFF])]),
+        );
+
+        // regexp_instr counts every byte of a truncated multi-byte sequence as
+        // one character, so "\xE4\xB8" has two characters and a `$` match at
+        // its end is reported at position 3, like TiDB does.
+        eval_regexp_on_bytes(
+            ScalarFuncSig::RegexpInStrSig,
+            FieldTypeTp::LongLong,
+            &[0xE4, 0xB8],
+            b"$",
+            &[],
+            &[],
+            |v| assert_eq!(v.as_ref().to_int_vec(), vec![Some(3)]),
+        );
+
+        // Two latin1 characters match one by one: the second occurrence of "."
+        // in "\xFF\xE9" starts at position 2.
+        eval_regexp_on_bytes(
+            ScalarFuncSig::RegexpInStrSig,
+            FieldTypeTp::LongLong,
+            &[0xFF, 0xE9],
+            b".",
+            &[1, 2],
+            &[],
+            |v| assert_eq!(v.as_ref().to_int_vec(), vec![Some(2)]),
+        );
+
+        // regexp_replace substitutes invalid bytes like any other character.
+        eval_regexp_on_bytes(
+            ScalarFuncSig::RegexpReplaceSig,
+            FieldTypeTp::String,
+            &[b'a', 0xFF, b'b'],
+            b".",
+            &[],
+            &[b"X"],
+            |v| assert_eq!(v.as_ref().to_bytes_vec(), vec![Some(b"XXX".to_vec())]),
+        );
     }
 }
