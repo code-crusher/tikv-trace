@@ -11,6 +11,7 @@ use std::{
     ops::Deref,
 };
 
+pub use charset::{CharsetBinary, CharsetUtf8mb4};
 use codec::prelude::*;
 use num::Unsigned;
 

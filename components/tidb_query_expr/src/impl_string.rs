@@ -38,6 +38,24 @@ fn get_utf8_byte_index(s: &str, char_idx: usize) -> usize {
         .unwrap_or(s.len())
 }
 
+/// Iterates the UTF-8 chars of `s` together with their byte offsets, replacing
+/// malformed sequences the same way TiDB does: like Go's `utf8.DecodeRune`, a
+/// malformed sequence yields the replacement character and consumes one byte.
+/// Data in a non-UTF-8 charset (e.g. latin1) can hold bytes that are not valid
+/// UTF-8; the string functions must not fail on them. See
+/// `CharsetUtf8mb4::decode`.
+#[inline]
+fn utf8_chars(s: &[u8]) -> impl Iterator<Item = (char, usize)> + '_ {
+    CharsetUtf8mb4::decode(s)
+}
+
+/// Decodes `s` as UTF-8 the way TiDB does, replacing each malformed sequence
+/// with the replacement character. See `utf8_chars`.
+#[inline]
+fn decode_utf8_lossy(s: &[u8]) -> String {
+    utf8_chars(s).map(|(ch, _)| ch).collect()
+}
+
 #[rpn_fn(writer)]
 #[inline]
 pub fn bin(num: &Int, writer: BytesWriter) -> Result<BytesGuard> {
@@ -452,18 +470,26 @@ pub fn left_utf8(lhs: BytesRef, rhs: &Int, writer: BytesWriter) -> Result<BytesG
     if *rhs <= 0 {
         return Ok(writer.write_ref(Some(b"")));
     }
-    let s = str::from_utf8(lhs)?;
 
+    // Fast path: `lhs` is valid UTF-8, so slicing at the char boundary keeps
+    // the original bytes.
+    if let Ok(s) = str::from_utf8(lhs) {
+        let rhs = *rhs as usize;
+        let len = s.chars().count();
+        let result = if len > rhs {
+            let idx = get_utf8_byte_index(s, rhs);
+            &s.as_bytes()[..idx]
+        } else {
+            s.as_bytes()
+        };
+        return Ok(writer.write_ref(Some(result)));
+    }
+
+    // Invalid UTF-8 (e.g. latin1 bytes). TiDB decodes the string as runes,
+    // replacing each malformed byte with the replacement character, and
+    // re-encodes the result. See #20305.
     let rhs = *rhs as usize;
-    let len = s.chars().count();
-    let result = if len > rhs {
-        let idx = get_utf8_byte_index(s, rhs);
-        &s.as_bytes()[..idx]
-    } else {
-        s.as_bytes()
-    };
-
-    Ok(writer.write_ref(Some(result)))
+    Ok(writer.write_from_char_iter(utf8_chars(lhs).map(|(ch, _)| ch).take(rhs)))
 }
 
 #[rpn_fn(writer)]
@@ -544,25 +570,34 @@ pub fn right_utf8(lhs: BytesRef, rhs: &Int, writer: BytesWriter) -> Result<Bytes
         return Ok(writer.write_ref(Some(b"")));
     }
 
-    let s = str::from_utf8(lhs)?;
+    // Fast path: `lhs` is valid UTF-8, so slicing at the char boundary keeps
+    // the original bytes.
+    if let Ok(s) = str::from_utf8(lhs) {
+        let rhs = *rhs as usize;
+        let len = s.chars().count();
+        let result = if len > rhs {
+            let idx = get_utf8_byte_index(s, len - rhs);
+            &s.as_bytes()[idx..]
+        } else {
+            s.as_bytes()
+        };
+        return Ok(writer.write_ref(Some(result)));
+    }
 
+    // Invalid UTF-8 (e.g. latin1 bytes). TiDB decodes the string as runes,
+    // replacing each malformed byte with the replacement character, and
+    // re-encodes the result. See #20305.
     let rhs = *rhs as usize;
-    let len = s.chars().count();
-    let result = if len > rhs {
-        let idx = get_utf8_byte_index(s, len - rhs);
-        &s.as_bytes()[idx..]
-    } else {
-        s.as_bytes()
-    };
-
-    Ok(writer.write_ref(Some(result)))
+    let len = utf8_chars(lhs).count();
+    let start = len.saturating_sub(rhs);
+    Ok(writer.write_from_char_iter(utf8_chars(lhs).map(|(ch, _)| ch).skip(start)))
 }
 
 #[rpn_fn(writer)]
 #[inline]
 pub fn upper_utf8<E: Encoding>(arg: BytesRef, writer: BytesWriter) -> Result<BytesGuard> {
-    let s = str::from_utf8(arg)?;
-    Ok(E::upper(s, writer))
+    let s = decode_utf8_lossy(arg);
+    Ok(E::upper(&s, writer))
 }
 
 #[rpn_fn(writer)]
@@ -576,8 +611,8 @@ pub fn upper(arg: BytesRef, writer: BytesWriter) -> Result<BytesGuard> {
 #[rpn_fn(writer)]
 #[inline]
 pub fn lower_utf8<E: Encoding>(arg: BytesRef, writer: BytesWriter) -> Result<BytesGuard> {
-    let s = str::from_utf8(arg)?;
-    Ok(E::lower(s, writer))
+    let s = decode_utf8_lossy(arg);
+    Ok(E::lower(&s, writer))
 }
 
 #[rpn_fn(writer)]
@@ -925,8 +960,7 @@ pub fn char_length(bs: BytesRef) -> Result<Option<Int>> {
 #[rpn_fn]
 #[inline]
 pub fn char_length_utf8(bs: BytesRef) -> Result<Option<Int>> {
-    let s = str::from_utf8(bs)?;
-    Ok(Some(s.chars().count() as i64))
+    Ok(Some(utf8_chars(bs).count() as i64))
 }
 
 #[rpn_fn(writer)]
@@ -1082,14 +1116,13 @@ fn substring_utf8(input: BytesRef, pos: Int, len: Int, writer: BytesWriter) -> R
         return Ok(writer.write_ref(Some(b"")));
     }
 
-    let input = str::from_utf8(input)?;
-    let char_len = input.chars().count();
+    let char_len = utf8_chars(input).count();
     let start = if pos_positive {
         (pos - 1).min(char_len)
     } else {
         char_len.checked_sub(pos).unwrap_or(char_len)
     };
-    Ok(writer.write_from_char_iter(input.chars().skip(start).take(len)))
+    Ok(writer.write_from_char_iter(utf8_chars(input).map(|(ch, _)| ch).skip(start).take(len)))
 }
 
 #[rpn_fn(writer)]
@@ -2534,6 +2567,14 @@ mod tests {
                 Some(i64::MAX),
                 Some("数据库".as_bytes().to_vec()),
             ),
+            // latin1 0xFF is invalid UTF-8; like TiDB, each malformed byte is
+            // replaced with U+FFFD and re-encoded, see #20305.
+            (Some(vec![0x41, 0xFF]), Some(1i64), Some(b"A".to_vec())),
+            (
+                Some(vec![0xE4, 0xBD, 0xA0, 0xFF]),
+                Some(2i64),
+                Some("\u{4F60}\u{FFFD}".as_bytes().to_vec()),
+            ),
             (None, Some(-1), None),
             (Some(b"hello".to_vec()), None, None),
             (None, None, None),
@@ -2824,6 +2865,23 @@ mod tests {
                 Some(i64::MAX),
                 Some("数据库".as_bytes().to_vec()),
             ),
+            // latin1 0xFF is invalid UTF-8; like TiDB, each malformed byte is
+            // replaced with U+FFFD and re-encoded, see #20305.
+            (
+                Some(vec![0x41, 0xFF]),
+                Some(1),
+                Some("\u{FFFD}".as_bytes().to_vec()),
+            ),
+            (
+                Some(vec![0xE4, 0xBD, 0xA0, 0xFF]),
+                Some(1),
+                Some("\u{FFFD}".as_bytes().to_vec()),
+            ),
+            (
+                Some(vec![0xE4, 0xBD, 0xA0, 0xFF]),
+                Some(2),
+                Some("\u{4F60}\u{FFFD}".as_bytes().to_vec()),
+            ),
             (None, Some(-1), None),
             (Some(b"hello".to_vec()), None, None),
             (None, None, None),
@@ -2867,6 +2925,13 @@ mod tests {
             (
                 Some("ƛɤ".as_bytes().to_vec()),
                 Some("ꟜꟋ".as_bytes().to_vec()),
+            ),
+            // latin1 0xFF is invalid UTF-8; like TiDB, it becomes U+FFFD,
+            // see #20305.
+            (Some(vec![0xFF]), Some("\u{FFFD}".as_bytes().to_vec())),
+            (
+                Some(vec![0x41, 0xE9, 0x42]),
+                Some("A\u{FFFD}B".as_bytes().to_vec()),
             ),
             (None, None),
         ];
@@ -3108,6 +3173,13 @@ mod tests {
             (
                 Some("ꟜꟋ".as_bytes().to_vec()),
                 Some("ƛɤ".as_bytes().to_vec()),
+            ),
+            // latin1 0xFF is invalid UTF-8; like TiDB, it becomes U+FFFD,
+            // see #20305.
+            (Some(vec![0xFF]), Some("\u{FFFD}".as_bytes().to_vec())),
+            (
+                Some(vec![0x41, 0xE9, 0x42]),
+                Some("a\u{FFFD}b".as_bytes().to_vec()),
             ),
             (None, None),
         ];
@@ -4254,25 +4326,32 @@ mod tests {
             assert_eq!(output, expected_output);
         }
 
-        let invalid_utf8_cases: Vec<Vec<u8>> = vec![
-            vec![0xc0],
-            vec![0xf6],
-            vec![0x00, 0x9f],
-            vec![0xc3, 0x28],
-            vec![0xe2, 0x28, 0xa1],
-            vec![0xe2, 0x82, 0x28],
-            vec![0xf0, 0x28, 0x8c, 0xbc],
-            vec![0xf0, 0x90, 0x28, 0xbc],
-            vec![0xf0, 0x28, 0x8c, 0x28],
-            vec![0xf8, 0xa1, 0xa1, 0xa1, 0xa0],
-            vec![0xfc, 0xa1, 0xa1, 0xa1, 0xa1, 0xa0],
+        // Malformed UTF-8 is decoded like TiDB does: each malformed byte
+        // becomes one replacement character, so it counts as one char.
+        let invalid_utf8_cases: Vec<(Vec<u8>, i64)> = vec![
+            (vec![0xc0], 1),
+            (vec![0xf6], 1),
+            (vec![0x00, 0x9f], 2),
+            (vec![0xc3, 0x28], 2),
+            (vec![0xe2, 0x28, 0xa1], 3),
+            (vec![0xe2, 0x82, 0x28], 3),
+            (vec![0xf0, 0x28, 0x8c, 0xbc], 4),
+            (vec![0xf0, 0x90, 0x28, 0xbc], 4),
+            (vec![0xf0, 0x28, 0x8c, 0x28], 4),
+            (vec![0xf8, 0xa1, 0xa1, 0xa1, 0xa0], 5),
+            (vec![0xfc, 0xa1, 0xa1, 0xa1, 0xa1, 0xa0], 6),
+            // latin1 0xFF and 0xE9, see issue #20305 and #20153.
+            (vec![0xff], 1),
+            (vec![0x41, 0xff], 2),
+            (vec![0xe9], 1),
         ];
 
-        for arg in invalid_utf8_cases {
+        for (arg, expected_output) in invalid_utf8_cases {
             let output = RpnFnScalarEvaluator::new()
-                .push_param(arg)
-                .evaluate::<i64>(ScalarFuncSig::CharLengthUtf8);
-            output.unwrap_err();
+                .push_param(Some(arg))
+                .evaluate::<i64>(ScalarFuncSig::CharLengthUtf8)
+                .unwrap();
+            assert_eq!(output, Some(expected_output));
         }
     }
 
@@ -4738,6 +4817,18 @@ mod tests {
                 Some(-1),
                 Some("".as_bytes().to_vec()),
             ),
+            // latin1 0xFF is invalid UTF-8; like TiDB, each malformed byte is
+            // replaced with U+FFFD, see #20305.
+            (
+                Some(vec![0x41, 0xFF, 0x42]),
+                Some(2),
+                Some("\u{FFFD}B".as_bytes().to_vec()),
+            ),
+            (
+                Some(vec![0x41, 0xFF, 0x42]),
+                Some(-2),
+                Some("\u{FFFD}B".as_bytes().to_vec()),
+            ),
         ];
 
         for (str, pos, exp) in cases {
@@ -4866,6 +4957,20 @@ mod tests {
                 Some(1),
                 Some(1),
                 Some("".as_bytes().to_vec()),
+            ),
+            // latin1 0xFF is invalid UTF-8; like TiDB, each malformed byte is
+            // replaced with U+FFFD, see #20305.
+            (
+                Some(vec![0x41, 0xFF, 0x42]),
+                Some(1),
+                Some(2),
+                Some("A\u{FFFD}".as_bytes().to_vec()),
+            ),
+            (
+                Some(vec![0x41, 0xFF, 0x42]),
+                Some(-2),
+                Some(1),
+                Some("\u{FFFD}".as_bytes().to_vec()),
             ),
         ];
 

@@ -68,6 +68,24 @@ impl Charset for CharsetUtf8mb4 {
     }
 }
 
+impl CharsetUtf8mb4 {
+    /// Iterates the UTF-8 chars of `bstr` together with their byte offsets,
+    /// decoding malformed sequences like `CharsetUtf8mb4::decode_one` does.
+    /// TiDB decodes string values this way (Go's `utf8.DecodeRune`), so the
+    /// string functions pushed down to TiKV must not fail on invalid UTF-8
+    /// (e.g. latin1 bytes in a non-UTF-8 charset); see #20305.
+    #[inline]
+    pub fn decode(bstr: &[u8]) -> impl Iterator<Item = (char, usize)> + '_ {
+        let mut offset = 0;
+        std::iter::from_fn(move || {
+            let (ch, width) = Self::decode_one(&bstr[offset..])?;
+            let start = offset;
+            offset += width;
+            Some((ch, start))
+        })
+    }
+}
+
 // gbk character data actually stored with utf8mb4 character encoding.
 pub type CharsetGbk = CharsetUtf8mb4;
 
@@ -103,6 +121,36 @@ mod tests {
                 CharsetUtf8mb4::decode_one(input),
                 Some((char::REPLACEMENT_CHARACTER, 1))
             );
+        }
+    }
+
+    #[test]
+    fn test_utf8mb4_decode() {
+        let expect: Vec<(char, usize)> = "aé你🐶".chars().zip([0, 1, 3, 6]).collect();
+        assert_eq!(
+            CharsetUtf8mb4::decode("aé你🐶".as_bytes()).collect::<Vec<_>>(),
+            expect
+        );
+        assert_eq!(CharsetUtf8mb4::decode(b"").collect::<Vec<_>>(), vec![]);
+
+        // Each malformed byte yields one replacement character, like Go.
+        let cases = [
+            (
+                &[0x41, 0xFF][..],
+                vec![('A', 0), (char::REPLACEMENT_CHARACTER, 1)],
+            ),
+            (&[0xE9][..], vec![(char::REPLACEMENT_CHARACTER, 0)]),
+            (
+                &[0xC3, 0x28][..],
+                vec![(char::REPLACEMENT_CHARACTER, 0), ('(', 1)],
+            ),
+            (
+                &[0xE4, 0xBD, 0xA0, 0xE4][..],
+                vec![('你', 0), (char::REPLACEMENT_CHARACTER, 3)],
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(CharsetUtf8mb4::decode(input).collect::<Vec<_>>(), expected);
         }
     }
 }
