@@ -309,9 +309,25 @@ pub fn sub_string_and_duration(
     Ok(writer.write(None))
 }
 
-#[rpn_fn]
+#[rpn_fn(capture = [ctx])]
 #[inline]
-pub fn date_diff(from_time: &DateTime, to_time: &DateTime) -> Result<Option<Int>> {
+pub fn date_diff(
+    ctx: &mut EvalContext,
+    from_time: &DateTime,
+    to_time: &DateTime,
+) -> Result<Option<Int>> {
+    // `DATEDIFF` is one of the functions that reject incomplete dates (a zero
+    // month or day), see the note in the MySQL manual.
+    if from_time.invalid_zero() {
+        return ctx
+            .handle_invalid_time_error(Error::incorrect_datetime_value(from_time))
+            .map(|_| Ok(None))?;
+    }
+    if to_time.invalid_zero() {
+        return ctx
+            .handle_invalid_time_error(Error::incorrect_datetime_value(to_time))
+            .map(|_| Ok(None))?;
+    }
     Ok(from_time.date_diff(*to_time))
 }
 
@@ -1060,6 +1076,15 @@ fn add_sub_date_time_any_interval_any_as_string<
         Ok(d) => d,
         Err(e) => return ctx.handle_invalid_time_error(e).map(|_| Ok(None))?,
     };
+    // `DATE_ADD` and `DATE_SUB` are strict about incomplete dates, i.e. dates
+    // with a zero month or day, and reject them before the interval is
+    // evaluated. This matters when the interval itself cannot be decoded, as
+    // the already invalid date must yield NULL instead of an error.
+    if datetime.invalid_zero() {
+        return ctx
+            .handle_invalid_time_error(Error::incorrect_datetime_value(datetime))
+            .map(|_| Ok(None))?;
+    }
     let interval_str = interval.to_interval_string(
         ctx,
         metadata.unit,
@@ -1863,7 +1888,7 @@ mod tests {
             error::ERR_TRUNCATE_WRONG_VALUE,
             mysql::{MAX_FSP, Time},
         },
-        expr::EvalConfig,
+        expr::{EvalConfig, Flag, SqlMode},
     };
     use tipb::{FieldType, ScalarFuncSig};
     use tipb_helper::ExprDefBuilder;
@@ -2510,6 +2535,52 @@ mod tests {
                 .unwrap();
             assert_eq!(output, exp);
         }
+    }
+
+    #[test]
+    fn test_date_diff_invalid_zero() {
+        // `DATEDIFF` rejects incomplete dates, i.e. dates with a zero month or
+        // day, and reports them as warnings in non-strict mode.
+        let cases = vec![
+            ("0000-00-00 00:00:00", "2018-02-01 00:00:00"),
+            ("2018-02-01 00:00:00", "0000-00-00 00:00:00"),
+            ("2018-00-00 00:00:00", "2018-02-01 00:00:00"),
+            ("2018-02-01 00:00:00", "2018-00-01 00:00:00"),
+        ];
+        let mut ctx = EvalContext::default();
+        for (arg1, arg2) in cases {
+            let arg1 = Time::parse_datetime(&mut ctx, arg1, 6, true).unwrap();
+            let arg2 = Time::parse_datetime(&mut ctx, arg2, 6, true).unwrap();
+            let (output, ctx) = RpnFnScalarEvaluator::new()
+                .push_param(arg1)
+                .push_param(arg2)
+                .evaluate_raw(FieldTypeTp::LongLong, ScalarFuncSig::DateDiff);
+            assert_eq!(Option::<Int>::from(output.unwrap()), None);
+            assert_eq!(
+                ctx.warnings.warnings[0].get_code(),
+                ERR_TRUNCATE_WRONG_VALUE
+            );
+        }
+
+        // In strict mode with a zero date, the error is returned instead of a
+        // warning, matching `handleInvalidTimeError` in TiDB.
+        let mut parse_ctx = EvalContext::default();
+        let arg1 = Time::parse_datetime(&mut parse_ctx, "0000-00-00 00:00:00", 6, true).unwrap();
+        let arg2 = Time::parse_datetime(&mut parse_ctx, "2018-02-01 00:00:00", 6, true).unwrap();
+        let mut cfg = EvalConfig::new();
+        cfg.set_flag(Flag::IN_INSERT_STMT)
+            .set_sql_mode(SqlMode::NO_ZERO_DATE | SqlMode::STRICT_TRANS_TABLES);
+        let (output, _) = RpnFnScalarEvaluator::new()
+            .context(EvalContext::new(Arc::new(cfg)))
+            .push_param(arg1)
+            .push_param(arg2)
+            .evaluate_raw(FieldTypeTp::LongLong, ScalarFuncSig::DateDiff);
+        let err = output.unwrap_err();
+        assert!(
+            err.to_string().contains("Incorrect datetime value"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -4173,6 +4244,75 @@ mod tests {
                 }
                 _ => panic!("unknown field type {:?}", result_type),
             }
+        }
+    }
+
+    #[test]
+    fn test_add_sub_date_invalid_zero() {
+        // An incomplete date, i.e. a date with a zero month or day, makes
+        // `DATE_ADD` and `DATE_SUB` return NULL with a warning before the
+        // interval is even looked at, so an undecodable interval argument must
+        // not surface as an error. See issue #20306.
+        let cases = {
+            use ScalarFuncSig::*;
+            vec![
+                (AddDateIntString, "20240000", vec![0xffu8], "DAY"),
+                (SubDateIntString, "20240000", vec![0xffu8], "DAY"),
+                (AddDateStringString, "2024-00-00", vec![0xffu8], "DAY"),
+                (SubDateStringString, "2024-00-00", vec![0xffu8], "DAY"),
+                (AddDateStringString, "2024-00-00", b"1".to_vec(), "DAY"),
+                (SubDateIntString, "20240000", b"1".to_vec(), "DAY"),
+            ]
+        };
+        for (func_sig, time, interval, unit) in cases {
+            let mut cfg = EvalConfig::default();
+            cfg.is_test = true;
+            let mut ctx = EvalContext::new(Arc::new(cfg));
+            let (time_type, interval_type, result_type) = get_add_sub_date_expr_types(func_sig);
+            let mut result_field_type: FieldType = result_type.into();
+            result_field_type.set_decimal(MAX_FSP as i32);
+            let mut builder = ExprDefBuilder::scalar_func(func_sig, result_field_type);
+
+            match time_type {
+                FieldTypeTp::Long => {
+                    builder = builder
+                        .push_child(ExprDefBuilder::constant_int(i64::from_str(time).unwrap()))
+                }
+                FieldTypeTp::String => {
+                    builder =
+                        builder.push_child(ExprDefBuilder::constant_bytes(time.as_bytes().to_vec()))
+                }
+                _ => panic!("unexpected date type {:?}", time_type),
+            }
+            assert_eq!(interval_type, FieldTypeTp::String);
+            builder = builder.push_child(ExprDefBuilder::constant_bytes(interval));
+            builder = builder.push_child(ExprDefBuilder::constant_bytes(unit.as_bytes().to_vec()));
+            let node = builder.build();
+            let exp = RpnExpressionBuilder::build_from_expr_tree(node, &mut ctx, 1).unwrap();
+
+            let schema = &[];
+            let mut columns = LazyBatchColumnVec::empty();
+            let val = exp.eval(&mut ctx, schema, &mut columns, &[0], 1).unwrap();
+
+            assert!(val.is_vector());
+            let value = val.vector_value().unwrap().as_ref();
+            assert_eq!(value.len(), 1);
+            assert_eq!(
+                value.to_bytes_vec()[0],
+                None,
+                "{:?} {:?} {:?}",
+                func_sig,
+                time,
+                unit
+            );
+            assert_eq!(
+                ctx.warnings.warnings[0].get_code(),
+                ERR_TRUNCATE_WRONG_VALUE,
+                "{:?} {:?} {:?}",
+                func_sig,
+                time,
+                unit
+            );
         }
     }
 
