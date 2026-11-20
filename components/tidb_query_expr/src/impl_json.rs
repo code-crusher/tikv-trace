@@ -10,6 +10,8 @@ use tidb_query_datatype::{
     codec::{data_type::*, mysql::json::*},
 };
 
+const ESCAPED_UNICODE_BYTES_SIZE: usize = 4;
+
 #[rpn_fn]
 #[inline]
 fn json_depth(arg: JsonRef) -> Result<Option<i64>> {
@@ -160,6 +162,9 @@ fn json_object_validator(expr: &tipb::Expr) -> Result<()> {
 #[rpn_fn(nullable, raw_varg, extra_validator = json_object_validator)]
 #[inline]
 fn json_object(raw_args: &[ScalarValueRef]) -> Result<Option<Json>> {
+    // A BTreeMap keyed by raw bytes keeps the last value of duplicated
+    // keys, just like the map assignment in TiDB `builtinJSONObjectSig`,
+    // and sorts the keys by bytes like `appendBinaryObject` in TiDB.
     let mut pairs = BTreeMap::new();
     for chunk in raw_args.chunks(2) {
         assert_eq!(chunk.len(), 2);
@@ -169,8 +174,10 @@ fn json_object(raw_args: &[ScalarValueRef]) -> Result<Option<Json>> {
                 "Data truncation: JSON documents may not contain NULL member names."
             ));
         }
-        let key = String::from_utf8(key.unwrap().to_owned())
-            .map_err(tidb_query_datatype::codec::Error::from)?;
+        // Keys are not required to be valid UTF-8 (e.g. they may come from
+        // a binary or latin1 column), so keep the raw bytes. See
+        // tikv/tikv#20310.
+        let key: Vec<u8> = key.unwrap().to_vec();
 
         let value: Option<JsonRef> = chunk[1].as_json();
         let value = match value {
@@ -180,7 +187,11 @@ fn json_object(raw_args: &[ScalarValueRef]) -> Result<Option<Json>> {
 
         pairs.insert(key, value);
     }
-    Ok(Some(Json::from_object(pairs)?))
+    let pairs: Vec<(&[u8], JsonRef)> = pairs
+        .iter()
+        .map(|(key, value)| (key.as_slice(), value.as_ref()))
+        .collect();
+    Ok(Some(Json::from_kv_pairs(pairs)?))
 }
 
 // According to mysql 5.7,
@@ -309,12 +320,13 @@ fn json_valid(args: &[ScalarValueRef]) -> Result<Option<Int>> {
         _ => match received_et {
             EvalType::Json => args[0].as_json().and(Some(1)),
             EvalType::Bytes => match args[0].as_bytes() {
-                Some(p) => {
-                    let tmp_str =
-                        std::str::from_utf8(p).map_err(tidb_query_datatype::codec::Error::from)?;
-                    let json: serde_json::error::Result<Json> = serde_json::from_str(tmp_str);
-                    Some(json.is_ok() as Int)
-                }
+                // The argument may contain invalid UTF-8 bytes (e.g. from a
+                // binary or latin1 column). JSON_VALID is a predicate which
+                // never fails the statement, so it must not return an error
+                // for such values. See `builtinJSONValidStringSig` in TiDB,
+                // which calls `json.Valid` on the raw bytes; `json_valid`
+                // below mirrors that without any UTF-8 validation.
+                Some(p) => Some(is_valid_json(p) as Int),
                 _ => Some(0),
             },
             _ => Some(0),
@@ -324,16 +336,109 @@ fn json_valid(args: &[ScalarValueRef]) -> Result<Option<Int>> {
     Ok(r)
 }
 
+/// Checks whether the bytes form a valid JSON document, mirroring Go's
+/// `json.Valid` which TiDB uses in `builtinJSONValidStringSig`.
+///
+/// Unlike `serde_json::from_slice::<Json>` it does not require the bytes
+/// inside string literals to be valid UTF-8, so a binary or latin1 value
+/// containing such bytes is still a valid JSON document, just like in TiDB.
+#[inline]
+fn is_valid_json(bytes: &[u8]) -> bool {
+    let json: serde_json::error::Result<IgnoredAny> = serde_json::from_slice(bytes);
+    json.is_ok()
+}
+
 #[rpn_fn]
 #[inline]
 fn json_unquote(arg: BytesRef) -> Result<Option<Bytes>> {
-    let tmp_str = std::str::from_utf8(arg)?;
-    let first_char = tmp_str.chars().next();
-    let last_char = tmp_str.chars().last();
-    if tmp_str.len() >= 2 && first_char == Some('"') && last_char == Some('"') {
-        let _: IgnoredAny = serde_json::from_str(tmp_str)?;
+    // The argument may contain invalid UTF-8 bytes (e.g. from a binary or
+    // latin1 column). Both Go and TiDB process it byte by byte, so follow
+    // `unquoteJSONString` in TiDB here instead of failing on invalid UTF-8.
+    let first_char = arg.first();
+    let last_char = arg.last();
+    if arg.len() >= 2
+        && first_char == Some(&b'"')
+        && last_char == Some(&b'"')
+        && !is_valid_json(arg)
+    {
+        return Err(other_err!(
+            "Invalid JSON text: The document root must not be followed by other values."
+        ));
     }
-    Ok(Some(Bytes::from(self::unquote_string(tmp_str)?)))
+    Ok(Some(Bytes::from(unquote_bytes(arg)?)))
+}
+
+/// Unquotes the given bytes without requiring valid UTF-8. Only the escape
+/// sequences listed in
+/// <https://dev.mysql.com/doc/refman/5.7/en/json-modification-functions.html#json-unquote-character-escape-sequences>
+/// are processed; all other bytes are copied verbatim.
+///
+/// See `unquoteJSONString` in TiDB `types/json_binary_functions.go`.
+#[inline]
+fn unquote_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+    let first_char = bytes.first();
+    let last_char = bytes.last();
+    if bytes.len() >= 2 && first_char == Some(&b'"') && last_char == Some(&b'"') {
+        unquote_json_string(&bytes[1..bytes.len() - 1])
+    } else {
+        Ok(bytes.to_vec())
+    }
+}
+
+#[inline]
+fn unquote_json_string(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut ret = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 1;
+            if i == bytes.len() {
+                return Err(other_err!("Missing a closing quotation mark in string"));
+            }
+            match bytes[i] {
+                b'"' => ret.push(b'"'),
+                b'b' => ret.push(b'\x08'),
+                b'f' => ret.push(b'\x0C'),
+                b'n' => ret.push(b'\x0A'),
+                b'r' => ret.push(b'\x0D'),
+                b't' => ret.push(b'\x09'),
+                b'\\' => ret.push(b'\\'),
+                b'u' => {
+                    if i + ESCAPED_UNICODE_BYTES_SIZE + 1 > bytes.len() {
+                        return Err(other_err!(
+                            "Invalid unicode, byte len too short: {:?}",
+                            &bytes[i + 1..]
+                        ));
+                    }
+                    let (utf8, utf8_len) = decode_escaped_unicode(&bytes[i + 1..i + 5])?;
+                    ret.extend_from_slice(&utf8[..utf8_len]);
+                    i += ESCAPED_UNICODE_BYTES_SIZE;
+                }
+                c => ret.push(c),
+            }
+        } else {
+            ret.push(bytes[i]);
+        }
+        i += 1;
+    }
+    Ok(ret)
+}
+
+/// Decodes a `\uXXXX` escape sequence into its UTF-8 bytes, mirroring
+/// `decodeEscapedUnicode` in TiDB `types/json_binary_functions.go`. Returns
+/// the filled buffer and the number of bytes written.
+#[inline]
+fn decode_escaped_unicode(bytes: &[u8]) -> Result<([u8; 4], usize)> {
+    let unicode = u16::from_str_radix(
+        std::str::from_utf8(bytes).map_err(tidb_query_datatype::codec::Error::from)?,
+        16,
+    )
+    .map_err(|e| other_err!("parse unicode error: {:?}", e))?;
+    let c = char::from_u32(u32::from(unicode))
+        .ok_or_else(|| other_err!("invalid char from: {:?}", bytes))?;
+    let mut ret = [0; 4];
+    let utf8_len = c.encode_utf8(&mut ret).len();
+    Ok((ret, utf8_len))
 }
 
 // Args should be like `(Option<JsonRef> , &[Option<BytesRef>])`.
@@ -350,16 +455,6 @@ fn valid_paths(expr: &tipb::Expr) -> Result<()> {
         super::function::validate_expr_return_type(child, EvalType::Bytes)?;
     }
     Ok(())
-}
-
-fn unquote_string(s: &str) -> Result<String> {
-    let first_char = s.chars().next();
-    let last_char = s.chars().last();
-    if s.len() >= 2 && first_char == Some('"') && last_char == Some('"') {
-        Ok(json_unquote::unquote_string(&s[1..s.len() - 1])?)
-    } else {
-        Ok(String::from(s))
-    }
 }
 
 #[rpn_fn(nullable, raw_varg, min_args = 2, extra_validator = json_with_paths_validator)]
@@ -781,6 +876,59 @@ mod tests {
 
             output.unwrap_err();
         }
+
+        // Keys are not required to be valid UTF-8, e.g. they may come from a
+        // binary or latin1 column. They must be kept as raw bytes instead of
+        // failing the statement. See tikv/tikv#20310.
+        let cases = vec![
+            (
+                vec![(vec![0xE9], Json::from_i64(1).unwrap())],
+                Json::from_kv_pairs(vec![(
+                    b"\xE9".as_slice(),
+                    Json::from_i64(1).unwrap().as_ref(),
+                )])
+                .unwrap(),
+            ),
+            (
+                vec![
+                    (vec![0xFF], Json::from_str("1").unwrap()),
+                    (vec![b'a'], Json::from_str(r#""b""#).unwrap()),
+                ],
+                Json::from_kv_pairs(vec![
+                    (b"\xFF".as_slice(), Json::from_str("1").unwrap().as_ref()),
+                    (b"a".as_slice(), Json::from_str(r#""b""#).unwrap().as_ref()),
+                ])
+                .unwrap(),
+            ),
+            (
+                // A duplicated key keeps only the last value, like the map
+                // assignment in TiDB `builtinJSONObjectSig`.
+                vec![
+                    (vec![0xE9], Json::from_i64(1).unwrap()),
+                    (vec![0xE9], Json::from_i64(2).unwrap()),
+                ],
+                Json::from_kv_pairs(vec![(
+                    b"\xE9".as_slice(),
+                    Json::from_i64(2).unwrap().as_ref(),
+                )])
+                .unwrap(),
+            ),
+        ];
+
+        for (vargs, expected) in cases {
+            let mut new_vargs: Vec<ScalarValue> = vec![];
+            for (key, value) in vargs {
+                new_vargs.push(ScalarValue::from(Bytes::from(key)));
+                new_vargs.push(ScalarValue::from(Some(value)));
+            }
+
+            let output: Json = RpnFnScalarEvaluator::new()
+                .push_params(new_vargs)
+                .evaluate(ScalarFuncSig::JsonObjectSig)
+                .unwrap()
+                .unwrap();
+            assert_eq!(output, expected);
+        }
     }
 
     #[test]
@@ -860,6 +1008,42 @@ mod tests {
                     assert_eq!(success, false);
                 }
             }
+        }
+
+        // Arguments containing invalid UTF-8 bytes (e.g. from a binary or
+        // latin1 column) must not fail the statement; the bytes are processed
+        // verbatim just like in TiDB, which unquotes them byte by byte.
+        // See tikv/tikv#20310.
+        let bytes_cases: Vec<(Option<Vec<u8>>, Option<Vec<u8>>)> = vec![
+            // X'22E922': a quoted latin1 'e' with its accent.
+            (Some(vec![0x22, 0xE9, 0x22]), Some(vec![0xE9])),
+            // X'22FF22': a quoted string containing the 0xFF byte.
+            (Some(vec![0x22, 0xFF, 0x22]), Some(vec![0xFF])),
+            // An unquoted latin1 byte stays as is.
+            (Some(vec![0xE9, 0x31]), Some(vec![0xE9, 0x31])),
+            // Escape sequences are still processed around invalid UTF-8
+            // bytes: "\n" becomes a newline byte.
+            (
+                Some(vec![0x22, 0x5C, 0x6E, 0xE9, 0x22]),
+                Some(vec![0x0A, 0xE9]),
+            ),
+            // An escaped unicode sequence is decoded to its UTF-8 bytes,
+            // here "\\u00E0" followed by the latin1 byte of 'e' with its
+            // accent.
+            (
+                Some(vec![0x22, 0x5C, 0x75, 0x30, 0x30, 0x45, 0x30, 0xE9, 0x22]),
+                Some(vec![0xC3, 0xA0, 0xE9]),
+            ),
+        ];
+
+        for (arg, expect) in bytes_cases {
+            let arg = arg.map(Bytes::from);
+            let expect = expect.map(Bytes::from);
+            let output = RpnFnScalarEvaluator::new()
+                .push_param(arg.clone())
+                .evaluate(ScalarFuncSig::JsonUnquoteSig)
+                .unwrap();
+            assert_eq!(output, expect, "{:?}", arg);
         }
     }
 
@@ -992,6 +1176,52 @@ mod tests {
             (vec![Some(b"\"2019-8-19\"".to_vec()).into()], Some(1)),
             (vec![Some(2).into()], Some(0)),
             (vec![Some(2.5).into()], Some(0)),
+            // Bytes containing invalid UTF-8 must not raise an error. TiDB
+            // evaluates them with Go's `json.Valid`, which treats the bytes
+            // inside a string literal as raw bytes.
+            // See tikv/tikv#20310.
+            (
+                // X'22FF22': a quoted string containing 0xFF.
+                vec![Some(Bytes::from(vec![0x22, 0xFF, 0x22])).into()],
+                Some(1),
+            ),
+            (
+                // X'22E922': a quoted string containing the latin1 byte of
+                // 'é'.
+                vec![Some(Bytes::from(vec![0x22, 0xE9, 0x22])).into()],
+                Some(1),
+            ),
+            (
+                // A bare latin1 byte is not a JSON document.
+                vec![Some(Bytes::from(vec![0xE9])).into()],
+                Some(0),
+            ),
+            (
+                // A quoted string containing an invalid UTF-8 sequence.
+                vec![Some(Bytes::from(vec![0x22, 0xC3, 0x22])).into()],
+                Some(1),
+            ),
+            (
+                // An object with an invalid UTF-8 key.
+                vec![Some(Bytes::from(vec![0x7B, 0x22, 0xFF, 0x22, 0x3A, 0x31, 0x7D])).into()],
+                Some(1),
+            ),
+            (
+                // A number followed by an invalid UTF-8 byte.
+                vec![Some(Bytes::from(vec![0x31, 0xFF])).into()],
+                Some(0),
+            ),
+            (
+                // A backslash followed by an invalid UTF-8 byte is an
+                // invalid escape sequence.
+                vec![Some(Bytes::from(vec![0x22, 0x5C, 0xFF, 0x22])).into()],
+                Some(0),
+            ),
+            (
+                // A control character inside a string literal.
+                vec![Some(Bytes::from(vec![0x22, 0x0A, 0x22])).into()],
+                Some(0),
+            ),
             (vec![None::<Json>.into()], None),
             (vec![None::<Bytes>.into()], None),
             (vec![None::<Int>.into()], None),
