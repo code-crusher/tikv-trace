@@ -1847,13 +1847,24 @@ impl ConvertTo<Decimal> for Real {
 }
 
 impl ConvertTo<Decimal> for &[u8] {
-    // FIXME: the err handle is not exactly same as TiDB's,
-    //  TiDB's seems has bug, fix this after fix TiDB's
     #[inline]
     fn convert(&self, ctx: &mut EvalContext) -> Result<Decimal> {
-        let r = Decimal::from_bytes(self).unwrap_or_else(|_| Res::Ok(Decimal::zero()));
-        let err = Error::overflow("DECIMAL", "");
-        r.into_result_with_overflow_err(ctx, err)
+        match Decimal::from_bytes(self) {
+            // A string which cannot be converted to decimal at all (e.g. "abc"
+            // or "") is a truncated value in MySQL/TiDB, which should be
+            // handled by the error context: an error in strict mode DML
+            // statements, a warning otherwise. See TiDB's
+            // `builtinCastStringAsDecimalSig.evalDecimal` and
+            // `MyDecimal::FromString`.
+            Err(_) => {
+                ctx.handle_truncate_err(Error::truncated_wrong_val("DECIMAL", escape(self)))?;
+                Ok(Decimal::zero())
+            }
+            Ok(r) => {
+                let err = Error::overflow("DECIMAL", "");
+                r.into_result_with_overflow_err(ctx, err)
+            }
+        }
     }
 }
 

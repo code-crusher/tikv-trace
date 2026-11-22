@@ -5506,19 +5506,11 @@ mod tests {
                     .unwrap()
                     .unwrap(),
             ),
-            // can not convert to decimal
-            ("abcde", false, false, Decimal::zero()),
-            ("", false, false, Decimal::zero()),
-            ("s", false, false, Decimal::zero()),
-            ("abcde", true, false, Decimal::zero()),
-            ("", true, false, Decimal::zero()),
-            ("s", true, false, Decimal::zero()),
-            ("abcde", false, true, Decimal::zero()),
-            ("", false, true, Decimal::zero()),
-            ("s", false, true, Decimal::zero()),
-            ("abcde", true, true, Decimal::zero()),
-            ("", true, true, Decimal::zero()),
-            ("s", true, true, Decimal::zero()),
+            // A string which cannot be converted to decimal at all (e.g.
+            // "abcde") is a truncated value, which is an error in strict
+            // mode and a warning otherwise. It is covered by
+            // `test_string_as_decimal_truncated` below, so it isn't listed
+            // here.
         ];
 
         test_as_decimal_helper(
@@ -5530,6 +5522,66 @@ mod tests {
             |x| x.to_string(),
             "cast_string_as_signed_decimal",
         )
+    }
+
+    #[test]
+    fn test_string_as_decimal_truncated() {
+        // Strings which cannot be converted to decimal at all are truncated
+        // values: in strict mode DML statements (neither
+        // `Flag::IGNORE_TRUNCATE` nor `Flag::TRUNCATE_AS_WARNING` is set) the
+        // cast fails with 1292, otherwise a warning is recorded and zero is
+        // returned. See issue #20299 and TiDB's
+        // `builtinCastStringAsDecimalSig.evalDecimal`.
+        let inputs: Vec<BytesRef> = vec![b"abcde", b"", b" "];
+
+        for input in inputs {
+            let rft = FieldTypeConfig::default().into();
+            let extra = make_extra(&rft);
+            let input_str = String::from_utf8_lossy(input).to_string();
+
+            // Strict mode DML statement.
+            let mut ctx = CtxConfig::default().into();
+            let res = cast_bytes_as_decimal(&mut ctx, &extra, Some(input));
+            let err = res.err().unwrap();
+            let msg = format!("{}", err);
+            assert_eq!(
+                msg,
+                format!(
+                    "Evaluate error: Truncated incorrect DECIMAL value: '{}'",
+                    input_str
+                ),
+                "input: {}",
+                input_str
+            );
+            assert_eq!(ctx.warnings.warning_cnt, 0);
+
+            // Statement which records a warning instead (e.g. SELECT).
+            let mut ctx: EvalContext = CtxConfig {
+                truncate_as_warning: true,
+                ..CtxConfig::default()
+            }
+            .into();
+            let res = cast_bytes_as_decimal(&mut ctx, &extra, Some(input));
+            assert_eq!(res.unwrap().unwrap(), Decimal::zero());
+            assert_eq!(ctx.warnings.warning_cnt, 1);
+            assert_eq!(
+                ctx.warnings.warnings[0].get_code(),
+                ERR_TRUNCATE_WRONG_VALUE
+            );
+            assert_eq!(
+                ctx.warnings.warnings[0].get_msg(),
+                format!(
+                    "evaluation failed: Truncated incorrect DECIMAL value: '{}'",
+                    input_str
+                ),
+            );
+
+            // Read-only statement which ignores truncate errors.
+            let mut ctx = EvalContext::new(Arc::new(EvalConfig::from_flag(Flag::IGNORE_TRUNCATE)));
+            let res = cast_bytes_as_decimal(&mut ctx, &extra, Some(input));
+            assert_eq!(res.unwrap().unwrap(), Decimal::zero());
+            assert_eq!(ctx.warnings.warning_cnt, 0);
+        }
     }
 
     #[test]
@@ -5713,19 +5765,11 @@ mod tests {
                     .unwrap()
                     .unwrap(),
             ),
-            // can not convert to decimal
-            ("abcde", false, false, Decimal::zero()),
-            ("", false, false, Decimal::zero()),
-            ("s", false, false, Decimal::zero()),
-            ("abcde", true, false, Decimal::zero()),
-            ("", true, false, Decimal::zero()),
-            ("s", true, false, Decimal::zero()),
-            ("abcde", false, true, Decimal::zero()),
-            ("", false, true, Decimal::zero()),
-            ("s", false, true, Decimal::zero()),
-            ("abcde", true, true, Decimal::zero()),
-            ("", true, true, Decimal::zero()),
-            ("s", true, true, Decimal::zero()),
+            // A string which cannot be converted to decimal at all (e.g.
+            // "abcde") is a truncated value, which is an error in strict
+            // mode and a warning otherwise. It is covered by
+            // `test_string_as_decimal_truncated` above, so it isn't listed
+            // here.
         ];
 
         test_as_decimal_helper(
@@ -6491,6 +6535,55 @@ mod tests {
             cast_bytes_as_duration,
             true,
         )
+    }
+
+    #[test]
+    fn test_bytes_as_duration_truncated() {
+        // A string which can only be partially parsed as a duration (e.g.
+        // "12:34:56x") is a truncated value: in strict mode DML statements
+        // (neither `Flag::IGNORE_TRUNCATE` nor `Flag::TRUNCATE_AS_WARNING` is
+        // set) the cast fails with 1292, otherwise a warning is recorded and
+        // the parsed value is returned. See issue #20299 and TiDB's
+        // `builtinCastStringAsDurationSig.evalDuration`.
+        let inputs: Vec<BytesRef> = vec![b"12:34:56x", b"1234abc"];
+
+        for input in inputs {
+            let rft = FieldTypeConfig {
+                decimal: 0,
+                ..FieldTypeConfig::default()
+            }
+            .into();
+            let extra = make_extra(&rft);
+            let input_str = String::from_utf8_lossy(input).to_string();
+
+            // Strict mode DML statement.
+            let mut ctx = CtxConfig::default().into();
+            let res = cast_bytes_as_duration(&mut ctx, &extra, Some(input));
+            assert!(res.is_err(), "input: {}", input_str);
+            assert_eq!(ctx.warnings.warning_cnt, 0);
+
+            // Statement which records a warning instead (e.g. SELECT).
+            let mut ctx: EvalContext = CtxConfig {
+                truncate_as_warning: true,
+                ..CtxConfig::default()
+            }
+            .into();
+            let res = cast_bytes_as_duration(&mut ctx, &extra, Some(input));
+            assert!(res.is_ok(), "input: {}", input_str);
+            assert_eq!(ctx.warnings.warning_cnt, 1, "input: {}", input_str);
+            assert_eq!(
+                ctx.warnings.warnings[0].get_code(),
+                ERR_TRUNCATE_WRONG_VALUE,
+                "input: {}",
+                input_str
+            );
+
+            // Read-only statement which ignores truncate errors.
+            let mut ctx = EvalContext::new(Arc::new(EvalConfig::from_flag(Flag::IGNORE_TRUNCATE)));
+            let res = cast_bytes_as_duration(&mut ctx, &extra, Some(input));
+            assert!(res.is_ok(), "input: {}", input_str);
+            assert_eq!(ctx.warnings.warning_cnt, 0);
+        }
     }
 
     #[test]

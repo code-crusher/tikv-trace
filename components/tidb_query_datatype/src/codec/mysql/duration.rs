@@ -267,7 +267,13 @@ mod parser {
 
         match duration {
             Some(Ok(duration)) => {
-                let _ = ctx.handle_truncate(truncated_parse);
+                if truncated_parse
+                    && ctx
+                        .handle_truncate_err(Error::truncated_wrong_val("TIME", input))
+                        .is_err()
+                {
+                    return None;
+                }
                 Some(duration)
             }
             Some(Err(err)) if err.is_overflow() => {
@@ -913,8 +919,69 @@ mod tests {
         ];
 
         for (input, fsp, expect) in cases {
-            let got = Duration::parse(&mut EvalContext::default(), input, fsp);
+            // Truncated inputs (e.g. "1234abc") produce a warning in
+            // non-strict mode and the parsed value is still returned, so the
+            // value assertions run with `TRUNCATE_AS_WARNING` (see
+            // `test_parse_duration_truncate_as_warning` and
+            // `test_parse_duration_truncate_as_error` for the strict side).
+            let mut ctx =
+                EvalContext::new(Arc::new(EvalConfig::from_flag(Flag::TRUNCATE_AS_WARNING)));
+            let got = Duration::parse(&mut ctx, input, fsp);
             assert_eq!(got.ok().map(|d| d.to_string()), expect.map(str::to_string));
+        }
+    }
+
+    #[test]
+    fn test_parse_duration_truncate_as_warning() {
+        let cases: Vec<(&str, i8, Option<&'static str>)> = vec![
+            ("1234abc", 0, Some("00:12:34")),
+            ("1234x", 0, Some("00:12:34")),
+            ("1234xxxxxxx", 0, Some("00:12:34")),
+            ("-1234xxxxxxx", 0, Some("-00:12:34")),
+            ("1x", 6, Some("00:00:01.000000")),
+            ("0x", 6, Some("00:00:00.000000")),
+            ("12:34:56x", 0, Some("12:34:56")),
+        ];
+
+        for (input, fsp, expect) in cases {
+            let mut ctx =
+                EvalContext::new(Arc::new(EvalConfig::from_flag(Flag::TRUNCATE_AS_WARNING)));
+            let got = Duration::parse(&mut ctx, input, fsp);
+            assert_eq!(got.ok().map(|d| d.to_string()), expect.map(str::to_string));
+            assert_eq!(ctx.warnings.warning_cnt, 1, "input: {}", input);
+            assert_eq!(
+                ctx.warnings.warnings[0].get_code(),
+                ERR_TRUNCATE_WRONG_VALUE,
+                "input: {}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_duration_truncate_as_error() {
+        let cases: Vec<(&str, i8)> = vec![
+            ("1234abc", 0),
+            ("12:34:56x", 0),
+            ("1x", 6),
+            ("a", 0),
+            ("", 0),
+        ];
+
+        for (input, fsp) in cases {
+            // Neither `IGNORE_TRUNCATE` nor `TRUNCATE_AS_WARNING` is set: a
+            // truncated input must be an error, like in a strict mode
+            // INSERT/UPDATE/DELETE statement.
+            let mut ctx = EvalContext::default();
+            let got = Duration::parse(&mut ctx, input, fsp);
+            let err = got.err().unwrap();
+            assert_eq!(err.code(), ERR_TRUNCATE_WRONG_VALUE, "input: {}", input);
+            assert!(
+                format!("{}", err).contains(input.trim()),
+                "input: {}, err: {}",
+                input,
+                err
+            );
         }
     }
 

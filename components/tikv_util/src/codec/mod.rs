@@ -31,7 +31,7 @@ pub fn read_slice<'a>(data: &mut BytesSlice<'a>, size: usize) -> Result<BytesSli
 /// // ["hello", "hellp") contains "hello*"
 /// assert_eq!(&next_prefix_of(b"hello".to_vec()), b"hellp");
 /// // [[255], []) contains keys matches [255, *]
-/// assert_eq!(&next_prefix_of(vec![0xffu8]), &[]);
+/// assert_eq!(&next_prefix_of(vec![0xffu8]), &Vec::<u8>::new());
 /// // [[42, 255], [43]) contains keys matches [42, 255, *]
 /// assert_eq!(&next_prefix_of(vec![42u8, 0xffu8]), &[43u8]);
 /// ```
