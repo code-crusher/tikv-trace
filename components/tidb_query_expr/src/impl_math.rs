@@ -328,7 +328,8 @@ fn cot(arg: &Real) -> Result<Option<Real>> {
 #[rpn_fn]
 fn pow(lhs: &Real, rhs: &Real) -> Result<Option<Real>> {
     let pow = (lhs.into_inner()).pow(rhs.into_inner());
-    if pow.is_infinite() {
+    // TiDB reports an overflow for any non-finite result, including NaN.
+    if !pow.is_finite() {
         Err(Error::overflow("DOUBLE", format!("pow({}, {})", lhs, rhs)).into())
     } else {
         Ok(Real::new(pow).ok())
@@ -1392,6 +1393,11 @@ mod tests {
                 Some(Real::new(0.0f64).unwrap()),
                 Some(Real::new(-9999999.0f64).unwrap()),
             ),
+            // A NaN result is treated as an overflow, the same as TiDB.
+            (
+                Some(Real::new(-1.0f64).unwrap()),
+                Some(Real::new(0.5f64).unwrap()),
+            ),
         ];
 
         for (lhs, rhs) in invalid_cases {
@@ -1401,6 +1407,19 @@ mod tests {
                 .evaluate::<Real>(ScalarFuncSig::Pow)
                 .unwrap_err();
         }
+
+        // TiDB reports the same overflow error for a NaN result as for an
+        // infinite one.
+        let err = RpnFnScalarEvaluator::new()
+            .push_param(Some(Real::new(-1.0f64).unwrap()))
+            .push_param(Some(Real::new(0.5f64).unwrap()))
+            .evaluate::<Real>(ScalarFuncSig::Pow)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("DOUBLE value is out of range in 'pow(-1, 0.5)'"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
